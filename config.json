@@ -1,0 +1,39 @@
+{
+  "mqtt": {
+    "enabled": false,
+    "broker": "192.168.1.10",
+    "port": 1883,
+    "username": "dooruser",
+    "password": "secret",
+    "client_id": "door_access_pi",
+    "keepalive": 60,
+    "tls": false,
+    "tls_ca_cert": null
+  },
+  "gpio": {
+    "relay_pin": 17,
+    "led_pin": 18,
+    "button_pin": 27,
+    "door_sensor_pin": 22,
+    "door_sensor_active_low": true
+  },
+  "lock": {
+    "unlock_duration_seconds": 5,
+    "active_low_relay": true
+  },
+  "door": {
+    "open_alert_threshold_seconds": 30
+  },
+  "logging": {
+    "log_file": "/var/log/door_access.log",
+    "backup_count": 7,
+    "level": "INFO"
+  },
+  "nfc": {
+    "uid_debounce_seconds": 2.0
+  },
+  "authorized_uids": {
+    "AABB1122": "Alice",
+    "CCDD3344": "Bob"
+  }
+}

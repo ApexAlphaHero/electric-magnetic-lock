@@ -1,0 +1,9 @@
+# Never commit a real config with credentials
+# The config.json in this repo has placeholder values only
+# The real config lives at /etc/door_access/config.json on the Pi
+
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.log

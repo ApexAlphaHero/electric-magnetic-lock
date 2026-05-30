@@ -1,0 +1,21 @@
+[Unit]
+Description=Door Access Control System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=door
+Group=door
+ExecStart=/usr/bin/python3 /opt/door_access/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=door_access
+Environment=PYTHONUNBUFFERED=1
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
