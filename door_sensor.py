@@ -9,11 +9,14 @@ logger = logging.getLogger(__name__)
 
 
 class DoorSensor:
-    def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
+    def __init__(self, event_queue: queue.Queue, name: str, pin: int,
+                 active_low: bool, alert_threshold: float,
+                 shutdown_event: threading.Event):
         self._queue = event_queue
-        self._pin: int = config["gpio"]["door_sensor_pin"]
-        self._alert_threshold: float = config["door"]["open_alert_threshold_seconds"]
-        self._active_low: bool = config["gpio"].get("door_sensor_active_low", True)
+        self._name = name
+        self._pin = pin
+        self._active_low = active_low
+        self._alert_threshold = alert_threshold
         self._shutdown = shutdown_event
         self._state: str = "UNKNOWN"
         self._state_lock = threading.Lock()
@@ -28,7 +31,7 @@ class DoorSensor:
             self._state = initial
             if initial == "OPEN":
                 self._door_open_since = time.monotonic()
-        logger.info("DoorSensor ready: pin=GPIO%d initial=%s", self._pin, initial)
+        logger.info("DoorSensor '%s' ready: pin=GPIO%d initial=%s", self._name, self._pin, initial)
 
     def start(self) -> None:
         GPIO.add_event_detect(
@@ -43,7 +46,7 @@ class DoorSensor:
         self._alert_thread.start()
         # Publish the initial state so HA gets it on startup
         try:
-            self._queue.put_nowait({"type": "DOOR_STATE", "state": self._state})
+            self._queue.put_nowait({"type": "DOOR_STATE", "door": self._name, "state": self._state})
         except queue.Full:
             pass
 
@@ -74,7 +77,7 @@ class DoorSensor:
                 self._door_open_since = None
                 self._alert_sent = False
         try:
-            self._queue.put_nowait({"type": "DOOR_STATE", "state": new_state})
+            self._queue.put_nowait({"type": "DOOR_STATE", "door": self._name, "state": new_state})
         except queue.Full:
             logger.warning("Event queue full, dropping DOOR_STATE event")
 
@@ -91,6 +94,8 @@ class DoorSensor:
                     if elapsed >= self._alert_threshold:
                         self._alert_sent = True
                         try:
-                            self._queue.put_nowait({"type": "DOOR_ALERT", "elapsed": elapsed})
+                            self._queue.put_nowait(
+                                {"type": "DOOR_ALERT", "door": self._name, "elapsed": elapsed}
+                            )
                         except queue.Full:
                             logger.warning("Event queue full, dropping DOOR_ALERT")

@@ -15,7 +15,9 @@ mqtt_handler.py ──►             └─ logging
 lock_controller.py (button ISR) ──►
 ```
 
-Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALERT`, `UNLOCK_TIMER_EXPIRED`
+Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALERT`, `SET_UNLOCK_DURATION`, `UNLOCK_TIMER_EXPIRED`
+
+`DOOR_STATE`/`DOOR_ALERT` carry a `door` key (door name) — there is one `DoorSensor` instance per configured door.
 
 ## File Map
 
@@ -24,7 +26,7 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 | `main.py` | Entry point, logging setup, signal handlers, event dispatch loop |
 | `nfc_reader.py` | `NFCReader` class — pyscard PC/SC, GET_UID APDU `[0xFF,0xCA,0x00,0x00,0x00]`, daemon thread; ACR1552 LED/buzzer feedback via CCID escape (beep + green=granted / blue-blink=denied) |
 | `lock_controller.py` | `LockController` class — GPIO17 relay, GPIO18 LED, GPIO27 button ISR, `threading.Timer` auto-relock |
-| `door_sensor.py` | `DoorSensor` class — GPIO22 reed switch, edge detection, door-open alert monitor thread |
+| `door_sensor.py` | `DoorSensor` class — one instance per door (name + pin + active_low), edge detection, per-door open-too-long alert monitor thread; events tagged with `door` |
 | `mqtt_handler.py` | `MQTTHandler` class — paho-mqtt, LWT, retain flags, auto-reconnect via `loop_start()`; HA MQTT discovery (`_publish_discovery`) + tag scanner (`publish_tag`) |
 | `config.json` | All runtime settings (deployed to `/etc/door_access/config.json` on Pi) |
 | `door_access.service` | systemd unit — runs as `door` user, auto-restart on failure |
@@ -36,8 +38,11 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 - **GPIO17** — Relay HAT signal (active-low: LOW = unlocked, HIGH = locked)
 - **GPIO18** — LED button illumination (HIGH = on when unlocked)
 - **GPIO27** — Button input, internal pull-up, FALLING edge = press
-- **GPIO22** — Reed switch, internal pull-up, LOW = door open
+- **GPIO22** — Left door sensor (NC fridge-light switch), internal pull-up, LOW = open
+- **GPIO23** — Right door sensor (NC fridge-light switch), internal pull-up, LOW = open
 - **USB** — ACR1552U NFC reader (pyscard/PC/SC, `pcscd` daemon required)
+
+Two doors, **one shared lock** (single relay on GPIO17). Door sensors are configured via the `doors` list in `config.json`.
 
 ## Runtime Paths on Pi
 
@@ -54,7 +59,9 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 | `home/door/availability` | pub | No | `online`/`offline` |
 | `home/door/lock/state` | pub | Yes | `LOCKED`/`UNLOCKED` |
 | `home/door/lock/set` | sub | — | `LOCK`/`UNLOCK` |
-| `home/door/sensor/state` | pub | Yes | `OPEN`/`CLOSED` |
+| `home/door/sensor/<name>/state` | pub | Yes | `OPEN`/`CLOSED` (one per door) |
+| `home/door/unlock_duration/state` | pub | Yes | current unlock seconds |
+| `home/door/unlock_duration/set` | sub | — | seconds 1–60 (HA `number` entity) |
 | `home/door/alert` | pub | No | string |
 | `home/door/last_access` | pub | Yes | JSON |
 | `home/door/nfc/tag` | pub | No | raw UID of every scan (HA MQTT tag scanner) |

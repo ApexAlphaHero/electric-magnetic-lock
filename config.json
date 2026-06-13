@@ -15,10 +15,12 @@
   "gpio": {
     "relay_pin": 17,
     "led_pin": 18,
-    "button_pin": 27,
-    "door_sensor_pin": 22,
-    "door_sensor_active_low": true
+    "button_pin": 27
   },
+  "doors": [
+    { "name": "left",  "sensor_pin": 22, "active_low": true },
+    { "name": "right", "sensor_pin": 23, "active_low": true }
+  ],
   "lock": {
     "unlock_duration_seconds": 5,
     "active_low_relay": true

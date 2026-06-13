@@ -20,6 +20,17 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         return json.load(f)
 
 
+def save_config(config: dict, path: str = CONFIG_PATH) -> None:
+    """Persist config to disk (used when a setting is changed at runtime, e.g.
+    the unlock duration set from Home Assistant). Writes atomically."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    import os
+    os.replace(tmp, path)
+
+
 def setup_logging(config: dict) -> logging.Logger:
     log_cfg = config.get("logging", {})
     log_file = log_cfg.get("log_file", "/var/log/door_access.log")
@@ -69,8 +80,7 @@ def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
     mqtt.publish_tag(uid)
     if uid in authorized:
         name = authorized[uid]
-        duration = config["lock"]["unlock_duration_seconds"]
-        lock_ctrl.unlock(duration=duration)
+        lock_ctrl.unlock()  # uses the controller's current default duration
         mqtt.publish_lock_state("UNLOCKED")
         mqtt.publish_last_access(uid=uid, name=name, granted=True)
         mqtt.publish_alert(f"ACCESS_GRANTED uid={uid} name={name}")
@@ -83,8 +93,7 @@ def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
 
 def _handle_button(lock_ctrl: LockController, mqtt: MQTTHandler,
                    config: dict, logger: logging.Logger) -> None:
-    duration = config["lock"]["unlock_duration_seconds"]
-    lock_ctrl.unlock(duration=duration)
+    lock_ctrl.unlock()  # uses the controller's current default duration
     mqtt.publish_lock_state("UNLOCKED")
     mqtt.publish_alert("BUTTON_UNLOCK")
     logger.info("Access via button press")
@@ -104,16 +113,31 @@ def _handle_mqtt_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandl
 
 
 def _handle_door_state(event: dict, mqtt: MQTTHandler, logger: logging.Logger) -> None:
+    door = event.get("door", "door")
     state = event["state"]
-    mqtt.publish_door_state(state)
-    logger.info("Door sensor: %s", state)
+    mqtt.publish_door_state(door, state)
+    logger.info("Door sensor '%s': %s", door, state)
 
 
 def _handle_door_alert(event: dict, mqtt: MQTTHandler, logger: logging.Logger) -> None:
+    door = event.get("door", "door")
     elapsed = event["elapsed"]
-    msg = f"DOOR_OPEN_TOO_LONG elapsed={elapsed:.0f}s"
+    msg = f"DOOR_OPEN_TOO_LONG door={door} elapsed={elapsed:.0f}s"
     mqtt.publish_alert(msg)
     logger.warning("Alert: %s", msg)
+
+
+def _handle_set_unlock_duration(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
+                                config: dict, logger: logging.Logger) -> None:
+    seconds = max(1.0, min(60.0, float(event["seconds"])))
+    lock_ctrl.set_default_duration(seconds)
+    config["lock"]["unlock_duration_seconds"] = seconds
+    try:
+        save_config(config)
+    except Exception as e:
+        logger.error("Failed to persist unlock duration: %s", e)
+    mqtt.publish_unlock_duration(seconds)
+    logger.info("Unlock duration set to %.0fs", seconds)
 
 
 def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
@@ -129,6 +153,8 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
         _handle_door_state(event, mqtt, logger)
     elif etype == "DOOR_ALERT":
         _handle_door_alert(event, mqtt, logger)
+    elif etype == "SET_UNLOCK_DURATION":
+        _handle_set_unlock_duration(event, lock_ctrl, mqtt, config, logger)
     elif etype == "UNLOCK_TIMER_EXPIRED":
         lock_ctrl.lock()
         mqtt.publish_lock_state("LOCKED")
@@ -152,6 +178,25 @@ def run_event_loop(event_queue: queue.Queue, shutdown_event: threading.Event,
     logger.info("Event loop stopped")
 
 
+def _build_door_sensors(event_queue: queue.Queue, config: dict,
+                        shutdown_event: threading.Event) -> list[DoorSensor]:
+    threshold = config["door"]["open_alert_threshold_seconds"]
+    doors_cfg = config.get("doors")
+    if not doors_cfg:
+        # Legacy single-sensor config (gpio.door_sensor_pin)
+        gpio = config["gpio"]
+        doors_cfg = [{
+            "name": "door",
+            "sensor_pin": gpio["door_sensor_pin"],
+            "active_low": gpio.get("door_sensor_active_low", True),
+        }]
+    return [
+        DoorSensor(event_queue, d["name"], d["sensor_pin"],
+                   d.get("active_low", True), threshold, shutdown_event)
+        for d in doors_cfg
+    ]
+
+
 def main() -> None:
     config = load_config()
     logger = setup_logging(config)
@@ -163,13 +208,14 @@ def main() -> None:
 
     mqtt_handler = MQTTHandler(event_queue, config, shutdown_event)
     lock_ctrl = LockController(event_queue, config, shutdown_event)
-    door_sensor = DoorSensor(event_queue, config, shutdown_event)
+    door_sensors = _build_door_sensors(event_queue, config, shutdown_event)
     nfc_reader = NFCReader(event_queue, config, shutdown_event)
 
     try:
         lock_ctrl.setup()
-        door_sensor.setup()
-        door_sensor.start()
+        for ds in door_sensors:
+            ds.setup()
+            ds.start()
         mqtt_handler.setup()
         mqtt_handler.connect()
         nfc_reader.start()
@@ -177,7 +223,8 @@ def main() -> None:
     finally:
         logger.info("Shutdown initiated")
         nfc_reader.stop()
-        door_sensor.stop()
+        for ds in door_sensors:
+            ds.stop()
         mqtt_handler.disconnect()
         lock_ctrl.cleanup()
         logger.info("Shutdown complete")

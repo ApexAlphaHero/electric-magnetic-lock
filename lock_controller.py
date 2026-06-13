@@ -80,6 +80,11 @@ class LockController:
         if self._state_change_callback:
             self._state_change_callback("UNLOCKED")
 
+    def set_default_duration(self, seconds: float) -> None:
+        """Update the auto-relock duration used by unlock() when no explicit
+        duration is given (settable from Home Assistant at runtime)."""
+        self._default_duration = seconds
+
     def get_state(self) -> str:
         with self._state_lock:
             return self._state

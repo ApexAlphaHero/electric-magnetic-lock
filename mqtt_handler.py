@@ -15,12 +15,16 @@ class MQTTHandler:
     TOPIC_ALERT        = "home/door/alert"
     TOPIC_LAST_ACCESS  = "home/door/last_access"
     TOPIC_TAG          = "home/door/nfc/tag"
+    TOPIC_UNLOCK_SET   = "home/door/unlock_duration/set"
+    TOPIC_UNLOCK_STATE = "home/door/unlock_duration/state"
 
     def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
         self._queue = event_queue
         self._cfg = config["mqtt"]
         self._shutdown = shutdown_event
         self._enabled: bool = self._cfg.get("enabled", True)
+        self._door_names = [d["name"] for d in config.get("doors", [])] or ["door"]
+        self._unlock_duration: float = config["lock"]["unlock_duration_seconds"]
         self._client = None
         self._connected = False
         self._connected_lock = threading.Lock()
@@ -79,8 +83,8 @@ class MQTTHandler:
     def publish_lock_state(self, state: str) -> None:
         self._safe_publish(self.TOPIC_LOCK_STATE, state, retain=True)
 
-    def publish_door_state(self, state: str) -> None:
-        self._safe_publish(self.TOPIC_DOOR_STATE, state, retain=True)
+    def publish_door_state(self, door: str, state: str) -> None:
+        self._safe_publish(f"home/door/sensor/{door}/state", state, retain=True)
 
     def publish_alert(self, message: str) -> None:
         self._safe_publish(self.TOPIC_ALERT, message, retain=False)
@@ -98,6 +102,15 @@ class MQTTHandler:
         """Publish a scanned UID for Home Assistant's MQTT tag scanner so each
         scan fires HA's native tag_scanned trigger. Not retained (it's an event)."""
         self._safe_publish(self.TOPIC_TAG, uid, retain=False)
+
+    def publish_unlock_duration(self, seconds: float) -> None:
+        self._unlock_duration = seconds
+        self._safe_publish(self.TOPIC_UNLOCK_STATE, self._fmt_duration(seconds), retain=True)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        # Send an int when it's whole (HA number entity displays cleanly)
+        return str(int(seconds)) if float(seconds).is_integer() else str(seconds)
 
     def _publish_discovery(self) -> None:
         """Publish Home Assistant MQTT discovery configs (retained) so the lock,
@@ -125,10 +138,11 @@ class MQTTHandler:
                 "state_locked": "LOCKED", "state_unlocked": "UNLOCKED",
                 **avail, "device": device,
             },
-            f"{prefix}/binary_sensor/door_access/door/config": {
-                "name": "Door", "unique_id": "door_access_door",
-                "state_topic": self.TOPIC_DOOR_STATE,
-                "payload_on": "OPEN", "payload_off": "CLOSED", "device_class": "door",
+            f"{prefix}/number/door_access/unlock_duration/config": {
+                "name": "Unlock Duration", "unique_id": "door_access_unlock_duration",
+                "command_topic": self.TOPIC_UNLOCK_SET, "state_topic": self.TOPIC_UNLOCK_STATE,
+                "min": 1, "max": 60, "step": 1, "unit_of_measurement": "s",
+                "mode": "box", "icon": "mdi:timer-lock-open", "retain": True,
                 **avail, "device": device,
             },
             f"{prefix}/sensor/door_access/last_access/config": {
@@ -149,8 +163,20 @@ class MQTTHandler:
                 "device": device,
             },
         }
+        # One binary_sensor per door.
+        for name in self._door_names:
+            configs[f"{prefix}/binary_sensor/door_access/door_{name}/config"] = {
+                "name": f"Door {name.capitalize()}",
+                "unique_id": f"door_access_door_{name}",
+                "state_topic": f"home/door/sensor/{name}/state",
+                "payload_on": "OPEN", "payload_off": "CLOSED", "device_class": "door",
+                **avail, "device": device,
+            }
         for topic, payload in configs.items():
             self._safe_publish(topic, json.dumps(payload), retain=True)
+        # Clear stale retained topics from the earlier single-door scheme.
+        self._safe_publish(f"{prefix}/binary_sensor/door_access/door/config", "", retain=True)
+        self._safe_publish(self.TOPIC_DOOR_STATE, "", retain=True)
         logger.info("Published HA MQTT discovery configs (%d entities)", len(configs))
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
@@ -160,7 +186,10 @@ class MQTTHandler:
             logger.info("MQTT connected to %s", self._cfg["broker"])
             client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=False)
             client.subscribe(self.TOPIC_LOCK_SET, qos=1)
+            client.subscribe(self.TOPIC_UNLOCK_SET, qos=1)
             self._publish_discovery()
+            # Publish current unlock duration so the HA number entity shows it.
+            self.publish_unlock_duration(self._unlock_duration)
         else:
             logger.error("MQTT connect refused (rc=%d)", rc)
 
@@ -174,13 +203,22 @@ class MQTTHandler:
 
     def _on_message(self, client, userdata, message) -> None:
         try:
-            payload = message.payload.decode("utf-8").strip().upper()
+            raw = message.payload.decode("utf-8").strip()
+            if message.topic == self.TOPIC_UNLOCK_SET:
+                try:
+                    seconds = float(raw)
+                except ValueError:
+                    logger.warning("Ignoring non-numeric unlock duration: %r", raw)
+                    return
+                self._queue.put_nowait({"type": "SET_UNLOCK_DURATION", "seconds": seconds})
+                return
+            payload = raw.upper()
             if payload in ("LOCK", "UNLOCK"):
                 self._queue.put_nowait({"type": "MQTT_COMMAND", "payload": payload})
             else:
                 logger.warning("Ignoring unknown MQTT command: %r", payload)
         except queue.Full:
-            logger.warning("Event queue full, dropping MQTT_COMMAND")
+            logger.warning("Event queue full, dropping MQTT message")
         except Exception as e:
             logger.error("Error processing MQTT message: %s", e)
 

@@ -10,10 +10,11 @@ Raspberry Pi door access control using an ACR1552U NFC reader, relay-controlled 
 
 | Pin | GPIO | Direction | Connected to |
 |-----|------|-----------|--------------|
-| 11  | 17   | Output    | Relay HAT signal |
+| 11  | 17   | Output    | Relay HAT signal (single lock, both doors) |
 | 12  | 18   | Output    | LED button (via 330Ω resistor) |
-| 13  | 27   | Input     | LED button momentary switch |
-| 15  | 22   | Input     | Reed switch door sensor |
+| 13  | 27   | Input     | LED button momentary switch (unlock) |
+| 15  | 22   | Input     | Door sensor — **left** (NC fridge-light switch) |
+| 16  | 23   | Input     | Door sensor — **right** (NC fridge-light switch) |
 | USB | —    | —         | ACR1552U NFC reader |
 
 ### Wiring Diagram
@@ -38,11 +39,18 @@ GPIO27 (pin 13) ──────────► Button terminal 1
 GND    (pin 14) ──────────► Button terminal 2
 (internal pull-up enabled; press = LOW)
 
-Reed Switch Door Sensor
+Door Sensors — one per door (NC momentary "fridge light" switches)
 ────────────────────────────────────────────────────────────────
-GPIO22 (pin 15) ──────────► Reed switch terminal 1
-GND    (pin 20) ──────────► Reed switch terminal 2
-(internal pull-up enabled; LOW = door open per wiring)
+GPIO22 (pin 15) ──────────► Left door switch terminal 1
+GND    (pin 20) ──────────► Left door switch terminal 2
+
+GPIO23 (pin 16) ──────────► Right door switch terminal 1
+GND    (pin 14/20) ───────► Right door switch terminal 2
+
+(internal pull-ups enabled. A normally-closed fridge-light switch is closed
+when the door is OPEN (plunger out) → reads LOW = OPEN; pressed when the door
+is CLOSED → reads HIGH. This matches "active_low": true per door. Verify each
+switch's polarity by watching `journalctl -u door_access -f` while opening it.)
 
 ACR1552U NFC Reader
 ────────────────────────────────────────────────────────────────
@@ -111,10 +119,12 @@ Edit `/etc/door_access/config.json` before starting the service:
   "gpio": {
     "relay_pin": 17,
     "led_pin": 18,
-    "button_pin": 27,
-    "door_sensor_pin": 22,
-    "door_sensor_active_low": true
+    "button_pin": 27
   },
+  "doors": [
+    { "name": "left",  "sensor_pin": 22, "active_low": true },
+    { "name": "right", "sensor_pin": 23, "active_low": true }
+  ],
   "lock": {
     "unlock_duration_seconds": 5,
     "active_low_relay": true
@@ -142,6 +152,8 @@ Edit `/etc/door_access/config.json` before starting the service:
 
 | Key | Purpose |
 |-----|---------|
+| `doors[]` | One entry per door: `name`, `sensor_pin` (BCM), `active_low` (LOW = open). Each becomes its own HA `binary_sensor` |
+| `lock.unlock_duration_seconds` | Default seconds the lock stays released (also settable live from HA's **Unlock Duration** number entity; changes persist here) |
 | `mqtt.discovery` | Publish Home Assistant MQTT discovery configs so entities auto-appear (default `true`) |
 | `mqtt.discovery_prefix` | HA discovery prefix (default `homeassistant`) |
 | `reader_feedback.enabled` | Beep + LED feedback on the reader for each scan (default `true`) |
@@ -201,10 +213,11 @@ sudo systemctl stop door_access
 |-------|--------|---------|
 | `home/door/availability` | No | `online` / `offline` |
 | `home/door/lock/state` | Yes | `LOCKED` / `UNLOCKED` |
-| `home/door/sensor/state` | Yes | `OPEN` / `CLOSED` |
+| `home/door/sensor/<name>/state` | Yes | `OPEN` / `CLOSED` — one topic per door (e.g. `left`, `right`) |
 | `home/door/alert` | No | Alert message string |
 | `home/door/last_access` | Yes | JSON (see below) |
 | `home/door/nfc/tag` | No | Raw UID of every scan (for HA's MQTT tag scanner) |
+| `home/door/unlock_duration/state` | Yes | Current unlock duration (seconds) |
 
 Discovery configs are also published (retained) under `homeassistant/.../config` when
 `mqtt.discovery` is enabled — see the Home Assistant section below.
@@ -214,6 +227,7 @@ Discovery configs are also published (retained) under `homeassistant/.../config`
 | Topic | Payload |
 |-------|---------|
 | `home/door/lock/set` | `LOCK` or `UNLOCK` |
+| `home/door/unlock_duration/set` | Number of seconds (1–60) to set the unlock duration |
 
 ### last_access JSON format
 
@@ -244,8 +258,9 @@ points at the same broker, a **"Door Access"** device shows up under
 
 | Entity | Type | Use |
 |--------|------|-----|
-| Lock | `lock` | **Actuate the door** — unlock = momentary release for `unlock_duration_seconds`, then auto-relock; lock = relock now |
-| Door | `binary_sensor` (door) | Open / closed |
+| Lock | `lock` | **Actuate the door** — unlock = momentary release for the unlock duration, then auto-relock; lock = relock now |
+| Unlock Duration | `number` | **Set how long the lock releases** (1–60 s, default 5) for NFC grants and HA unlocks; persists across restarts |
+| Door Left / Door Right | `binary_sensor` (door) | Open / closed — one per door |
 | Last Access | `sensor` | **Who scanned** — state = name; attributes `uid`, `granted`, `timestamp` |
 | Alert | `sensor` | Latest alert string (`UNAUTHORIZED_ACCESS …`, `DOOR_OPEN_TOO_LONG …`, etc.) |
 | NFC tag scanner | `tag` | Every scan fires HA's native `tag_scanned`; badges appear under **Settings → Tags** |
