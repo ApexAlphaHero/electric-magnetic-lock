@@ -22,13 +22,13 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 | File | Role |
 |------|------|
 | `main.py` | Entry point, logging setup, signal handlers, event dispatch loop |
-| `nfc_reader.py` | `NFCReader` class — pyscard PC/SC, GET_UID APDU `[0xFF,0xCA,0x00,0x00,0x00]`, daemon thread |
+| `nfc_reader.py` | `NFCReader` class — pyscard PC/SC, GET_UID APDU `[0xFF,0xCA,0x00,0x00,0x00]`, daemon thread; ACR1552 LED/buzzer feedback via CCID escape (beep + green=granted / blue-blink=denied) |
 | `lock_controller.py` | `LockController` class — GPIO17 relay, GPIO18 LED, GPIO27 button ISR, `threading.Timer` auto-relock |
 | `door_sensor.py` | `DoorSensor` class — GPIO22 reed switch, edge detection, door-open alert monitor thread |
-| `mqtt_handler.py` | `MQTTHandler` class — paho-mqtt, LWT, retain flags, auto-reconnect via `loop_start()` |
+| `mqtt_handler.py` | `MQTTHandler` class — paho-mqtt, LWT, retain flags, auto-reconnect via `loop_start()`; HA MQTT discovery (`_publish_discovery`) + tag scanner (`publish_tag`) |
 | `config.json` | All runtime settings (deployed to `/etc/door_access/config.json` on Pi) |
 | `door_access.service` | systemd unit — runs as `door` user, auto-restart on failure |
-| `install.sh` | Downloads files from GitHub, creates user, dirs, enables service |
+| `install.sh` | apt deps (incl. rpi-lgpio), CCID escape, door user, polkit rule, dirs, downloads files, enables service |
 | `README.md` | Wiring, setup, MQTT topic reference, HA config examples |
 
 ## Hardware
@@ -57,6 +57,8 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 | `home/door/sensor/state` | pub | Yes | `OPEN`/`CLOSED` |
 | `home/door/alert` | pub | No | string |
 | `home/door/last_access` | pub | Yes | JSON |
+| `home/door/nfc/tag` | pub | No | raw UID of every scan (HA MQTT tag scanner) |
+| `homeassistant/<comp>/door_access/.../config` | pub | Yes | HA MQTT discovery configs (lock, binary_sensor, sensor×2, tag) when `mqtt.discovery` true |
 
 ## Key Design Decisions
 
@@ -65,9 +67,18 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALER
 - **paho `loop_start()` not `loop_forever()`** — leaves main thread free for the event loop; reconnect is automatic.
 - **Config never overwritten on reinstall** — `install.sh` skips config download if `/etc/door_access/config.json` already exists.
 
+## Deployment Notes (Debian 13 / Pi OS trixie)
+
+- **Python deps via apt, not pip** — PEP 668 blocks system pip installs. Use `python3-pyscard`, `python3-paho-mqtt`, and **`python3-rpi-lgpio`** (lgpio-backed drop-in for `RPi.GPIO`; classic `python3-rpi.gpio` fails on 6.x kernels). Don't install both.
+- **systemd `WorkingDirectory`/`RuntimeDirectory`** — lgpio creates a `.lgd-nfy*` FIFO in the CWD, so the unit sets `RuntimeDirectory=door_access` + `WorkingDirectory=/run/door_access`.
+- **polkit rule** `/etc/polkit-1/rules.d/50-door-pcsc.rules` — grants the session-less `door` user PC/SC access (pcsc-lite default is allow_active only).
+- **CCID escape** — `/etc/libccid_Info.plist` `ifdDriverOptions=0x0001` enables the reader's LED/buzzer escape commands. Reader LED is **blue+green only (no red)**.
+- `install.sh` performs all of the above.
+
 ## Development Notes
 
 - The code uses Python 3.10+ union type syntax (`str | None`). Target Pi OS must have Python ≥ 3.10.
 - `RPi.GPIO` and `pyscard` are Pi-specific. For local dev/testing, mock them with `unittest.mock.MagicMock`.
 - Run `pcsc_scan` to verify the ACR1552U is recognized before starting the service.
 - Check `journalctl -u door_access -f` for live logs when running under systemd.
+- ACR1552 is **13.56 MHz only** (no 125 kHz LF tags); phones present a random UID per tap.

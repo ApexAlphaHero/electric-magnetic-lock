@@ -14,6 +14,7 @@ class MQTTHandler:
     TOPIC_DOOR_STATE   = "home/door/sensor/state"
     TOPIC_ALERT        = "home/door/alert"
     TOPIC_LAST_ACCESS  = "home/door/last_access"
+    TOPIC_TAG          = "home/door/nfc/tag"
 
     def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
         self._queue = event_queue
@@ -93,6 +94,65 @@ class MQTTHandler:
         })
         self._safe_publish(self.TOPIC_LAST_ACCESS, payload, retain=True)
 
+    def publish_tag(self, uid: str) -> None:
+        """Publish a scanned UID for Home Assistant's MQTT tag scanner so each
+        scan fires HA's native tag_scanned trigger. Not retained (it's an event)."""
+        self._safe_publish(self.TOPIC_TAG, uid, retain=False)
+
+    def _publish_discovery(self) -> None:
+        """Publish Home Assistant MQTT discovery configs (retained) so the lock,
+        door sensor, last-access sensor, alert sensor, and NFC tag scanner appear
+        automatically without manual YAML."""
+        if not self._cfg.get("discovery", True):
+            return
+        prefix = self._cfg.get("discovery_prefix", "homeassistant")
+        device = {
+            "identifiers": ["door_access_pi"],
+            "name": "Door Access",
+            "manufacturer": "DIY",
+            "model": "Raspberry Pi Door Controller",
+        }
+        avail = {
+            "availability_topic": self.TOPIC_AVAILABILITY,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        }
+        configs = {
+            f"{prefix}/lock/door_access/lock/config": {
+                "name": "Lock", "unique_id": "door_access_lock",
+                "state_topic": self.TOPIC_LOCK_STATE, "command_topic": self.TOPIC_LOCK_SET,
+                "payload_lock": "LOCK", "payload_unlock": "UNLOCK",
+                "state_locked": "LOCKED", "state_unlocked": "UNLOCKED",
+                **avail, "device": device,
+            },
+            f"{prefix}/binary_sensor/door_access/door/config": {
+                "name": "Door", "unique_id": "door_access_door",
+                "state_topic": self.TOPIC_DOOR_STATE,
+                "payload_on": "OPEN", "payload_off": "CLOSED", "device_class": "door",
+                **avail, "device": device,
+            },
+            f"{prefix}/sensor/door_access/last_access/config": {
+                "name": "Last Access", "unique_id": "door_access_last_access",
+                "state_topic": self.TOPIC_LAST_ACCESS,
+                "value_template": "{{ value_json.name }}",
+                "json_attributes_topic": self.TOPIC_LAST_ACCESS,
+                "icon": "mdi:account-key",
+                **avail, "device": device,
+            },
+            f"{prefix}/sensor/door_access/alert/config": {
+                "name": "Alert", "unique_id": "door_access_alert",
+                "state_topic": self.TOPIC_ALERT, "icon": "mdi:alert",
+                **avail, "device": device,
+            },
+            f"{prefix}/tag/door_access/config": {
+                "topic": self.TOPIC_TAG, "value_template": "{{ value }}",
+                "device": device,
+            },
+        }
+        for topic, payload in configs.items():
+            self._safe_publish(topic, json.dumps(payload), retain=True)
+        logger.info("Published HA MQTT discovery configs (%d entities)", len(configs))
+
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             with self._connected_lock:
@@ -100,6 +160,7 @@ class MQTTHandler:
             logger.info("MQTT connected to %s", self._cfg["broker"])
             client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=False)
             client.subscribe(self.TOPIC_LOCK_SET, qos=1)
+            self._publish_discovery()
         else:
             logger.error("MQTT connect refused (rc=%d)", rc)
 

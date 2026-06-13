@@ -2,6 +2,10 @@
 # Door Access Control — installer
 # Run as root:  sudo bash install.sh
 # Or one-liner: curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main/install.sh | sudo bash
+#
+# Target: Raspberry Pi OS / Debian 13 (trixie) or newer, Python >= 3.10.
+# On Debian 12+ PEP 668 blocks `pip install` into the system interpreter, so all
+# Python dependencies are installed from apt instead.
 
 set -euo pipefail
 
@@ -10,6 +14,8 @@ APP_DIR="/opt/door_access"
 CFG_DIR="/etc/door_access"
 LOG_FILE="/var/log/door_access.log"
 SERVICE_FILE="/etc/systemd/system/door_access.service"
+POLKIT_RULE="/etc/polkit-1/rules.d/50-door-pcsc.rules"
+CCID_PLIST="/etc/libccid_Info.plist"
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -30,37 +36,51 @@ download() {
     curl -fsSL "$url" -o "$dest"
 }
 
-# ── 1. System packages ─────────────────────────────────────────────────────────
+# ── 1. System + Python packages (all via apt; see PEP 668 note above) ────────────
 
 install_packages() {
     info "Updating package lists ..."
     apt-get update -qq
 
-    info "Installing system dependencies ..."
+    info "Installing dependencies ..."
+    # python3-rpi-lgpio is the lgpio-backed drop-in for RPi.GPIO. The classic
+    # python3-rpi.gpio package does not work on the 6.x kernels shipped with
+    # current Raspberry Pi OS; do NOT install both (they conflict).
     apt-get install -y \
-        python3-pip \
         pcscd \
         pcsc-tools \
         libpcsclite-dev \
-        python3-systemd
+        python3-pyscard \
+        python3-paho-mqtt \
+        python3-rpi-lgpio
 
     info "Enabling pcscd ..."
     systemctl enable pcscd
     systemctl start pcscd
 }
 
-# ── 2. Python packages ─────────────────────────────────────────────────────────
+# ── 2. Enable CCID escape commands (reader LED / buzzer feedback) ────────────────
 
-install_python_packages() {
-    info "Installing Python packages ..."
-    pip3 install --quiet RPi.GPIO pyscard
-
-    # paho-mqtt is only needed if mqtt.enabled is true in config.json
-    # Install it anyway so it's ready when you enable MQTT later
-    pip3 install --quiet paho-mqtt || warn "paho-mqtt install failed — MQTT will be unavailable"
+enable_reader_escape() {
+    # The ACR1552 LED and buzzer are driven via CCID "escape" commands, which the
+    # libccid driver rejects unless DRIVER_OPTION_CCID_EXCHANGE_AUTHORIZED (0x0001)
+    # is set in ifdDriverOptions. Safe to leave on for a dedicated appliance.
+    if [[ ! -f "$CCID_PLIST" ]]; then
+        warn "libccid plist not found at $CCID_PLIST — skipping escape enable (LED/buzzer may not work)"
+        return
+    fi
+    if grep -A1 ifdDriverOptions "$CCID_PLIST" | grep -q '0x0001'; then
+        info "CCID escape commands already enabled"
+    else
+        info "Enabling CCID escape commands (reader LED/buzzer) ..."
+        cp -n "$CCID_PLIST" "${CCID_PLIST}.bak"
+        # Replace the value on the line following the ifdDriverOptions key.
+        sed -i '/ifdDriverOptions/{n;s/0x0000/0x0001/}' "$CCID_PLIST"
+        systemctl restart pcscd
+    fi
 }
 
-# ── 3. System user ─────────────────────────────────────────────────────────────
+# ── 3. System user ───────────────────────────────────────────────────────────────
 
 create_user() {
     if id -u door &>/dev/null; then
@@ -76,7 +96,30 @@ create_user() {
     usermod -aG spi     door
 }
 
-# ── 4. Directories ─────────────────────────────────────────────────────────────
+# ── 4. polkit rule so the session-less 'door' user can reach pcscd ───────────────
+
+install_polkit_rule() {
+    # pcsc-lite's default polkit policy only allows users with an active local
+    # session. The 'door' systemd service has no session, so without this rule it
+    # gets "SCardEstablishContext: Access denied".
+    info "Installing polkit rule for PC/SC access ..."
+    install -d -m 755 "$(dirname "$POLKIT_RULE")"
+    cat > "$POLKIT_RULE" <<'EOF'
+// Allow the 'door' service user (which has no active login session) to
+// access the PC/SC daemon and smartcards.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.debian.pcsc-lite.access_pcsc" ||
+         action.id == "org.debian.pcsc-lite.access_card") &&
+        subject.user == "door") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+    chmod 644 "$POLKIT_RULE"
+    systemctl restart polkit || true
+}
+
+# ── 5. Directories ───────────────────────────────────────────────────────────────
 
 create_dirs() {
     info "Creating application directories ..."
@@ -84,7 +127,7 @@ create_dirs() {
     install -d -m 750 -o door -g door "$CFG_DIR"
 }
 
-# ── 5. Application files ───────────────────────────────────────────────────────
+# ── 6. Application files ─────────────────────────────────────────────────────────
 
 install_app_files() {
     info "Downloading application files ..."
@@ -145,7 +188,7 @@ EOF
     info "MQTT configured (broker=$mqtt_ip user=$mqtt_user)"
 }
 
-# ── 6. Log file ────────────────────────────────────────────────────────────────
+# ── 7. Log file ──────────────────────────────────────────────────────────────────
 
 create_log_file() {
     info "Creating log file ..."
@@ -154,7 +197,7 @@ create_log_file() {
     chmod 640 "$LOG_FILE"
 }
 
-# ── 7. systemd service ─────────────────────────────────────────────────────────
+# ── 8. systemd service ───────────────────────────────────────────────────────────
 
 install_service() {
     info "Installing systemd service ..."
@@ -170,8 +213,9 @@ install_service() {
 
 require_root
 install_packages
-install_python_packages
+enable_reader_escape
 create_user
+install_polkit_rule
 create_dirs
 install_app_files
 create_log_file

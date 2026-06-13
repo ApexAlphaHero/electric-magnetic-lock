@@ -65,6 +65,8 @@ def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
                 config: dict, logger: logging.Logger) -> None:
     uid = event["uid"]
     authorized = config["authorized_uids"]
+    # Forward every scan to Home Assistant's MQTT tag scanner (fires tag_scanned).
+    mqtt.publish_tag(uid)
     if uid in authorized:
         name = authorized[uid]
         duration = config["lock"]["unlock_duration_seconds"]

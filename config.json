@@ -8,7 +8,9 @@
     "client_id": "door_access_pi",
     "keepalive": 60,
     "tls": false,
-    "tls_ca_cert": null
+    "tls_ca_cert": null,
+    "discovery": true,
+    "discovery_prefix": "homeassistant"
   },
   "gpio": {
     "relay_pin": 17,
@@ -31,6 +33,9 @@
   },
   "nfc": {
     "uid_debounce_seconds": 2.0
+  },
+  "reader_feedback": {
+    "enabled": true
   },
   "authorized_uids": {
     "AABB1122": "Alice",

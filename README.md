@@ -57,27 +57,35 @@ USB port ─────────────────► Any Pi USB port 
 
 ### Prerequisites
 
+Target OS is **Raspberry Pi OS / Debian 13 (trixie)** or newer with **Python ≥ 3.10**. All
+Python dependencies come from apt — on Debian 12+ PEP 668 blocks `pip install` into the
+system interpreter.
+
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-pip pcscd pcsc-tools libpcsclite-dev python3-systemd
+sudo apt-get install -y \
+  pcscd pcsc-tools libpcsclite-dev \
+  python3-pyscard python3-paho-mqtt python3-rpi-lgpio
 ```
+
+> **`python3-rpi-lgpio`** is the lgpio-backed drop-in for `RPi.GPIO`. The classic
+> `python3-rpi.gpio` does **not** work on the 6.x kernels in current Pi OS — don't install both.
 
 ### One-liner install from GitHub
 
-Replace `YOUR_GITHUB_USERNAME` with your GitHub username before running:
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/electric-magnetic-lock/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main/install.sh | sudo bash
 ```
 
 The installer will:
-1. Install all system and Python packages
-2. Enable the `pcscd` PC/SC daemon
+1. Install all system + Python packages (from apt) and enable the `pcscd` PC/SC daemon
+2. Enable CCID escape commands in `/etc/libccid_Info.plist` (needed for the reader's LED/buzzer)
 3. Create a dedicated `door` system user with hardware group access
-4. Download all application files to `/opt/door_access/`
-5. Install the default config to `/etc/door_access/config.json`
-6. Create `/var/log/door_access.log`
-7. Install and enable the `door_access` systemd service
+4. Install a polkit rule so the session-less `door` user can reach `pcscd`
+5. Download all application files to `/opt/door_access/`
+6. Install the default config to `/etc/door_access/config.json`
+7. Create `/var/log/door_access.log`
+8. Install and enable the `door_access` systemd service
 
 ---
 
@@ -96,7 +104,9 @@ Edit `/etc/door_access/config.json` before starting the service:
     "client_id": "door_access_pi",
     "keepalive": 60,
     "tls": false,
-    "tls_ca_cert": null
+    "tls_ca_cert": null,
+    "discovery": true,
+    "discovery_prefix": "homeassistant"
   },
   "gpio": {
     "relay_pin": 17,
@@ -120,6 +130,9 @@ Edit `/etc/door_access/config.json` before starting the service:
   "nfc": {
     "uid_debounce_seconds": 2.0
   },
+  "reader_feedback": {
+    "enabled": true
+  },
   "authorized_uids": {
     "AABB1122": "Alice",
     "CCDD3344": "Bob"
@@ -127,9 +140,34 @@ Edit `/etc/door_access/config.json` before starting the service:
 }
 ```
 
+| Key | Purpose |
+|-----|---------|
+| `mqtt.discovery` | Publish Home Assistant MQTT discovery configs so entities auto-appear (default `true`) |
+| `mqtt.discovery_prefix` | HA discovery prefix (default `homeassistant`) |
+| `reader_feedback.enabled` | Beep + LED feedback on the reader for each scan (default `true`) |
+
 ### Finding a card's UID
 
-Run `pcsc_scan` and tap the card/phone to the reader. The UID will appear in the output. Add it to `authorized_uids` in uppercase hex with no spaces (e.g. `"AABB1122CC": "John"`).
+Run `pcsc_scan` and tap the card/phone to the reader, or watch `journalctl -u door_access -f`
+and tap (each scan logs `Access GRANTED/DENIED: UID=...`). Add it to `authorized_uids` in
+uppercase hex with no spaces (e.g. `"AABB1122CC": "John"`).
+
+> **Reader/tag compatibility:** the ACR1552 is a **13.56 MHz** reader (MIFARE/NTAG, ISO 14443).
+> It cannot read 125 kHz (LF) fobs/cards. Phones present a *random* UID per tap (Android HCE),
+> so they can't be enrolled as a stable credential.
+
+### Reader feedback (LED + buzzer)
+
+On every successful read the reader gives physical feedback via CCID escape commands:
+
+| Outcome | Feedback |
+|---------|----------|
+| Authorized UID | short **beep** + **solid green** |
+| Unauthorized UID | short **beep** + **blinking blue** |
+
+This requires CCID escape commands to be enabled (the installer sets `ifdDriverOptions`
+to `0x0001` in `/etc/libccid_Info.plist`). Note this reader's LED is **blue + green only —
+there is no red**. Disable with `"reader_feedback": {"enabled": false}`.
 
 ---
 
@@ -166,6 +204,10 @@ sudo systemctl stop door_access
 | `home/door/sensor/state` | Yes | `OPEN` / `CLOSED` |
 | `home/door/alert` | No | Alert message string |
 | `home/door/last_access` | Yes | JSON (see below) |
+| `home/door/nfc/tag` | No | Raw UID of every scan (for HA's MQTT tag scanner) |
+
+Discovery configs are also published (retained) under `homeassistant/.../config` when
+`mqtt.discovery` is enabled — see the Home Assistant section below.
 
 ### Subscribed by the Pi
 
@@ -193,14 +235,45 @@ sudo systemctl stop door_access
 | `BUTTON_UNLOCK` | Momentary button pressed |
 | `DOOR_OPEN_TOO_LONG elapsed=...s` | Door open past threshold |
 
-### Home Assistant MQTT integration example
+### Home Assistant integration
+
+With `mqtt.discovery` enabled (the default), the Pi publishes MQTT discovery configs and
+**all entities appear automatically** — no YAML needed. As long as HA's MQTT integration
+points at the same broker, a **"Door Access"** device shows up under
+**Settings → Devices & Services** with:
+
+| Entity | Type | Use |
+|--------|------|-----|
+| Lock | `lock` | **Actuate the door** — unlock = momentary release for `unlock_duration_seconds`, then auto-relock; lock = relock now |
+| Door | `binary_sensor` (door) | Open / closed |
+| Last Access | `sensor` | **Who scanned** — state = name; attributes `uid`, `granted`, `timestamp` |
+| Alert | `sensor` | Latest alert string (`UNAUTHORIZED_ACCESS …`, `DOOR_OPEN_TOO_LONG …`, etc.) |
+| NFC tag scanner | `tag` | Every scan fires HA's native `tag_scanned`; badges appear under **Settings → Tags** |
+
+#### Notify on a denied badge
 
 ```yaml
-# configuration.yaml
+automation:
+  - alias: Notify on denied badge
+    trigger:
+      - trigger: mqtt
+        topic: home/door/last_access
+    condition: "{{ trigger.payload_json.granted == false }}"
+    action:
+      - service: notify.mobile_app_your_phone
+        data:
+          message: "Denied badge {{ trigger.payload_json.uid }} at the cabinet door"
+```
 
+#### Manual YAML (only if you set `mqtt.discovery: false`)
+
+<details>
+<summary>configuration.yaml example</summary>
+
+```yaml
 mqtt:
   lock:
-    - name: "Front Door"
+    - name: "Cabinet Door"
       state_topic: "home/door/lock/state"
       command_topic: "home/door/lock/set"
       payload_lock: "LOCK"
@@ -210,7 +283,7 @@ mqtt:
       availability_topic: "home/door/availability"
 
   binary_sensor:
-    - name: "Front Door Sensor"
+    - name: "Cabinet Door Sensor"
       state_topic: "home/door/sensor/state"
       payload_on: "OPEN"
       payload_off: "CLOSED"
@@ -218,11 +291,12 @@ mqtt:
       availability_topic: "home/door/availability"
 
   sensor:
-    - name: "Front Door Last Access"
+    - name: "Cabinet Door Last Access"
       state_topic: "home/door/last_access"
       value_template: "{{ value_json.name }}"
       availability_topic: "home/door/availability"
 ```
+</details>
 
 ---
 
@@ -271,7 +345,7 @@ Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough 
   nfc_reader.py         ACR1552U NFC reader (pyscard/PC/SC)
   lock_controller.py    Relay, LED, button (RPi.GPIO)
   door_sensor.py        Reed switch (RPi.GPIO)
-  mqtt_handler.py       Home Assistant MQTT integration (paho-mqtt)
+  mqtt_handler.py       Home Assistant MQTT integration + discovery + tag scanner (paho-mqtt)
 
 /etc/door_access/
   config.json           Runtime configuration (edit this file)
@@ -281,4 +355,9 @@ Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough 
 
 /etc/systemd/system/
   door_access.service   systemd unit file
+
+/etc/polkit-1/rules.d/
+  50-door-pcsc.rules    Grants the 'door' service user PC/SC access
+
+/etc/libccid_Info.plist  ifdDriverOptions=0x0001 enables reader LED/buzzer escape commands
 ```

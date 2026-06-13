@@ -7,21 +7,35 @@ from smartcard.CardRequest import CardRequest
 from smartcard.CardType import AnyCardType
 from smartcard.Exceptions import (
     CardRequestTimeoutException,
-    EstablishContextException,
     NoCardException,
     CardConnectionException,
 )
+from smartcard.pcsc.PCSCExceptions import EstablishContextException
+from smartcard.scard import SCARD_CTL_CODE
 from smartcard.System import readers
 
 logger = logging.getLogger(__name__)
 
 GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
 
+# ACR1552 (ACS) peripheral control via CCID escape command.
+# Format: E0 00 00 <ins> <len> <data...>. Requires the CCID driver option
+# DRIVER_OPTION_CCID_EXCHANGE_AUTHORIZED (ifdDriverOptions 0x0001 in
+# /etc/libccid_Info.plist). This reader's LED is bi-color: bit0=blue, bit1=green
+# (no red). Commands are best-effort; failures are logged and ignored so the
+# read loop keeps working on readers that don't support them.
+ESCAPE_CTL_CODE = SCARD_CTL_CODE(1)
+_BUZZER = [0xE0, 0x00, 0x00, 0x28, 0x01]  # + duration byte
+_LED = [0xE0, 0x00, 0x00, 0x29, 0x01]     # + state byte
+LED_OFF, LED_BLUE, LED_GREEN = 0x00, 0x01, 0x02
+
 
 class NFCReader:
     def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
         self._queue = event_queue
         self._debounce_seconds: float = config["nfc"]["uid_debounce_seconds"]
+        self._authorized = config.get("authorized_uids", {})
+        self._feedback_enabled: bool = config.get("reader_feedback", {}).get("enabled", True)
         self._shutdown = shutdown_event
         self._last_uid: str | None = None
         self._last_uid_time: float = 0.0
@@ -64,6 +78,9 @@ class NFCReader:
                 uid = self._read_uid(cardservice.connection)
 
                 if uid:
+                    # Physical feedback on every successful read; LED colour
+                    # reflects authorization (debounce only gates the event).
+                    self._signal_read(cardservice.connection, uid in self._authorized)
                     if not self._is_debounced(uid):
                         self._last_uid = uid
                         self._last_uid_time = time.monotonic()
@@ -104,6 +121,29 @@ class NFCReader:
         except Exception as e:
             raise e
         return None
+
+    def _escape(self, connection, payload: list[int]) -> None:
+        try:
+            connection.control(ESCAPE_CTL_CODE, payload)
+        except Exception as e:
+            logger.debug("Reader escape command failed: %s", e)
+
+    def _signal_read(self, connection, granted: bool) -> None:
+        """Beep on a successful read, then show LED feedback: solid green when
+        the UID is authorized, blinking blue when it is not. Best-effort."""
+        if not self._feedback_enabled:
+            return
+        self._escape(connection, _BUZZER + [0x02])  # short beep
+        if granted:
+            self._escape(connection, _LED + [LED_GREEN])
+            self._shutdown.wait(1.2)
+            self._escape(connection, _LED + [LED_OFF])
+        else:
+            for _ in range(4):
+                self._escape(connection, _LED + [LED_BLUE])
+                self._shutdown.wait(0.15)
+                self._escape(connection, _LED + [LED_OFF])
+                self._shutdown.wait(0.15)
 
     def _is_debounced(self, uid: str) -> bool:
         if uid == self._last_uid:

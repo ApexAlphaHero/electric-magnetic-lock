@@ -8,6 +8,12 @@ Type=simple
 User=door
 Group=door
 ExecStart=/usr/bin/python3 /opt/door_access/main.py
+# rpi-lgpio/lgpio creates a notify FIFO (.lgd-nfy*) in the CWD, so the
+# service needs a writable working directory. RuntimeDirectory creates
+# /run/door_access (owned by the service user) before ExecStart.
+RuntimeDirectory=door_access
+RuntimeDirectoryMode=0750
+WorkingDirectory=/run/door_access
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
