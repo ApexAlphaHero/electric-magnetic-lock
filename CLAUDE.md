@@ -48,7 +48,7 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 
 - App files: `/opt/door_access/`
 - Config: `/etc/door_access/config.json`
-- Log: `/var/log/door_access.log` (daily rotation, 7 days)
+- Log: `/var/log/door_access/door_access.log` (door-owned dir so rotation works; daily rotation, 7 days)
 - Service: `/etc/systemd/system/door_access.service`
 - Service user: `door` (groups: gpio, plugdev, spi)
 

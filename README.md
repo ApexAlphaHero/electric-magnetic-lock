@@ -92,7 +92,7 @@ The installer will:
 4. Install a polkit rule so the session-less `door` user can reach `pcscd`
 5. Download all application files to `/opt/door_access/`
 6. Install the default config to `/etc/door_access/config.json`
-7. Create `/var/log/door_access.log`
+7. Create the log directory `/var/log/door_access/` (door-owned, so rotation works)
 8. Install and enable the `door_access` systemd service
 
 ---
@@ -133,7 +133,7 @@ Edit `/etc/door_access/config.json` before starting the service:
     "open_alert_threshold_seconds": 30
   },
   "logging": {
-    "log_file": "/var/log/door_access.log",
+    "log_file": "/var/log/door_access/door_access.log",
     "backup_count": 7,
     "level": "INFO"
   },
@@ -365,8 +365,8 @@ Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough 
 /etc/door_access/
   config.json           Runtime configuration (edit this file)
 
-/var/log/
-  door_access.log       Application log (rotated daily, 7 days kept)
+/var/log/door_access/
+  door_access.log       Application log (rotated daily, 7 days kept; door-owned dir so rotation works)
 
 /etc/systemd/system/
   door_access.service   systemd unit file

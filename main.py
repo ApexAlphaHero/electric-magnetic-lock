@@ -33,7 +33,7 @@ def save_config(config: dict, path: str = CONFIG_PATH) -> None:
 
 def setup_logging(config: dict) -> logging.Logger:
     log_cfg = config.get("logging", {})
-    log_file = log_cfg.get("log_file", "/var/log/door_access.log")
+    log_file = log_cfg.get("log_file", "/var/log/door_access/door_access.log")
     backup_count = log_cfg.get("backup_count", 7)
     level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
 

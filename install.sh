@@ -12,7 +12,8 @@ set -euo pipefail
 REPO="https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main"
 APP_DIR="/opt/door_access"
 CFG_DIR="/etc/door_access"
-LOG_FILE="/var/log/door_access.log"
+LOG_DIR="/var/log/door_access"
+LOG_FILE="$LOG_DIR/door_access.log"
 SERVICE_FILE="/etc/systemd/system/door_access.service"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-door-pcsc.rules"
 CCID_PLIST="/etc/libccid_Info.plist"
@@ -191,7 +192,11 @@ EOF
 # ── 7. Log file ──────────────────────────────────────────────────────────────────
 
 create_log_file() {
-    info "Creating log file ..."
+    # The log lives in its own door-owned directory so Python's
+    # TimedRotatingFileHandler can create rotated files (it renames within the
+    # directory, which /var/log itself does not permit a non-root user to do).
+    info "Creating log directory and file ..."
+    install -d -m 750 -o door -g door "$LOG_DIR"
     touch "$LOG_FILE"
     chown door:door "$LOG_FILE"
     chmod 640 "$LOG_FILE"

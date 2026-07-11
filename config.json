@@ -29,7 +29,7 @@
     "open_alert_threshold_seconds": 30
   },
   "logging": {
-    "log_file": "/var/log/door_access.log",
+    "log_file": "/var/log/door_access/door_access.log",
     "backup_count": 7,
     "level": "INFO"
   },
