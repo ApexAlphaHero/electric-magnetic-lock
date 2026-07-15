@@ -43,7 +43,7 @@ class MQTTHandler:
             return
 
         self._client = mqtt.Client(client_id=self._cfg.get("client_id", "door_access"))
-        self._client.will_set(self.TOPIC_AVAILABILITY, "offline", qos=1, retain=False)
+        self._client.will_set(self.TOPIC_AVAILABILITY, "offline", qos=1, retain=True)
         if self._cfg.get("username"):
             self._client.username_pw_set(
                 self._cfg["username"], self._cfg.get("password")
@@ -72,7 +72,7 @@ class MQTTHandler:
     def disconnect(self) -> None:
         if not self._enabled or self._client is None:
             return
-        self._safe_publish(self.TOPIC_AVAILABILITY, "offline", retain=False)
+        self._safe_publish(self.TOPIC_AVAILABILITY, "offline", retain=True)
         self._client.loop_stop()
         try:
             self._client.disconnect()
@@ -184,7 +184,7 @@ class MQTTHandler:
             with self._connected_lock:
                 self._connected = True
             logger.info("MQTT connected to %s", self._cfg["broker"])
-            client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=False)
+            client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=True)
             client.subscribe(self.TOPIC_LOCK_SET, qos=1)
             client.subscribe(self.TOPIC_UNLOCK_SET, qos=1)
             self._publish_discovery()

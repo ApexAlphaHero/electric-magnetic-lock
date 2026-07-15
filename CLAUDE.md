@@ -56,7 +56,7 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 
 | Topic | Direction | Retain | Payload |
 |-------|-----------|--------|---------|
-| `home/door/availability` | pub | No | `online`/`offline` |
+| `home/door/availability` | pub | Yes | `online`/`offline` (retained + LWT, so HA sees current state after a restart) |
 | `home/door/lock/state` | pub | Yes | `LOCKED`/`UNLOCKED` |
 | `home/door/lock/set` | sub | — | `LOCK`/`UNLOCK` |
 | `home/door/sensor/<name>/state` | pub | Yes | `OPEN`/`CLOSED` (one per door) |
