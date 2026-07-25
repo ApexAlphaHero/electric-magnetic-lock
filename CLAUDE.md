@@ -15,7 +15,9 @@ mqtt_handler.py ──►             └─ logging
 lock_controller.py (button ISR) ──►
 ```
 
-Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALERT`, `SET_UNLOCK_DURATION`, `UNLOCK_TIMER_EXPIRED`
+Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALERT`, `SET_UNLOCK_DURATION`, `UNLOCK_TIMER_EXPIRED`, `SET_ENROLL_MODE`, `SET_ENROLL_NAME`, `SET_SELECTED_TAG`, `REMOVE_SELECTED_TAG`
+
+HA-driven tag enrollment/removal: `SET_ENROLL_MODE` arms a **one-shot** capture (shared `runtime["enroll_event"]` also passed to `NFCReader` so an armed scan flashes green instead of blue). The next `NFC_UID` while armed writes `UID → name` into `config["authorized_uids"]`, persists via `save_config`, and disarms — it does **not** unlock. Removal deletes by selected name. Runtime enroll state (`enroll_name`, `selected_tag`, `enroll_event`) lives in a `runtime` dict in `main()`, never persisted.
 
 `DOOR_STATE`/`DOOR_ALERT` carry a `door` key (door name) — there is one `DoorSensor` instance per configured door.
 
@@ -62,10 +64,17 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 | `home/door/sensor/<name>/state` | pub | Yes | `OPEN`/`CLOSED` (one per door) |
 | `home/door/unlock_duration/state` | pub | Yes | current unlock seconds |
 | `home/door/unlock_duration/set` | sub | — | seconds 1–60 (HA `number` entity) |
+| `home/door/enroll/state` | pub | Yes | `ON`/`OFF` (enroll armed) |
+| `home/door/enroll/set` | sub | — | `ON`/`OFF` (HA `switch`, one-shot) |
+| `home/door/enroll_name/state` | pub | Yes | name for next enrolled tag |
+| `home/door/enroll_name/set` | sub | — | name string (HA `text`) |
+| `home/door/known_tags/state` | pub | Yes | selected known-tag name |
+| `home/door/known_tags/set` | sub | — | name to select (HA `select`, options track `authorized_uids`) |
+| `home/door/remove_tag/set` | sub | — | `PRESS` removes selected tag (HA `button`) |
 | `home/door/alert` | pub | No | string |
 | `home/door/last_access` | pub | Yes | JSON |
 | `home/door/nfc/tag` | pub | No | raw UID of every scan (HA MQTT tag scanner) |
-| `homeassistant/<comp>/door_access/.../config` | pub | Yes | HA MQTT discovery configs (lock, binary_sensor, sensor×2, tag) when `mqtt.discovery` true |
+| `homeassistant/<comp>/door_access/.../config` | pub | Yes | HA MQTT discovery configs (lock, number, binary_sensor×N, sensor×2, tag, switch, text, select, button) when `mqtt.discovery` true |
 
 ## Key Design Decisions
 

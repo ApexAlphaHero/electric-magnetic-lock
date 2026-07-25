@@ -17,6 +17,15 @@ class MQTTHandler:
     TOPIC_TAG          = "home/door/nfc/tag"
     TOPIC_UNLOCK_SET   = "home/door/unlock_duration/set"
     TOPIC_UNLOCK_STATE = "home/door/unlock_duration/state"
+    TOPIC_ENROLL_SET        = "home/door/enroll/set"
+    TOPIC_ENROLL_STATE      = "home/door/enroll/state"
+    TOPIC_ENROLL_NAME_SET   = "home/door/enroll_name/set"
+    TOPIC_ENROLL_NAME_STATE = "home/door/enroll_name/state"
+    TOPIC_KNOWN_SELECT      = "home/door/known_tags/set"
+    TOPIC_KNOWN_STATE       = "home/door/known_tags/state"
+    TOPIC_REMOVE_PRESS      = "home/door/remove_tag/set"
+
+    NO_TAGS = "(none)"
 
     def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
         self._queue = event_queue
@@ -25,6 +34,10 @@ class MQTTHandler:
         self._enabled: bool = self._cfg.get("enabled", True)
         self._door_names = [d["name"] for d in config.get("doors", [])] or ["door"]
         self._unlock_duration: float = config["lock"]["unlock_duration_seconds"]
+        # Shared reference (same dict object main mutates) so the Known Tags
+        # select always reflects the current authorized set.
+        self._authorized: dict = config.get("authorized_uids", {})
+        self._selected: str = self.NO_TAGS
         self._client = None
         self._connected = False
         self._connected_lock = threading.Lock()
@@ -107,6 +120,36 @@ class MQTTHandler:
         self._unlock_duration = seconds
         self._safe_publish(self.TOPIC_UNLOCK_STATE, self._fmt_duration(seconds), retain=True)
 
+    def publish_enroll_state(self, on: bool) -> None:
+        self._safe_publish(self.TOPIC_ENROLL_STATE, "ON" if on else "OFF", retain=True)
+
+    def publish_enroll_name(self, name: str) -> None:
+        self._safe_publish(self.TOPIC_ENROLL_NAME_STATE, name, retain=True)
+
+    def publish_selected_tag(self, name: str) -> None:
+        opts = self._known_options()
+        self._selected = name if name in opts else opts[0]
+        self._safe_publish(self.TOPIC_KNOWN_STATE, self._selected, retain=True)
+
+    def _known_options(self) -> list:
+        names = sorted(set(self._authorized.values()))
+        return names or [self.NO_TAGS]
+
+    def publish_known_tags(self) -> None:
+        """Refresh the Known Tags select: re-publish its discovery config with the
+        current option list, then publish a still-valid selected state. Call after
+        any change to authorized_uids (enroll/remove)."""
+        opts = self._known_options()
+        if self._selected not in opts:
+            self._selected = opts[0]
+        if self._cfg.get("discovery", True):
+            prefix = self._cfg.get("discovery_prefix", "homeassistant")
+            self._safe_publish(
+                f"{prefix}/select/door_access/known_tags/config",
+                json.dumps(self._known_tags_discovery()), retain=True,
+            )
+        self._safe_publish(self.TOPIC_KNOWN_STATE, self._selected, retain=True)
+
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
         # Send an int when it's whole (HA number entity displays cleanly)
@@ -119,17 +162,8 @@ class MQTTHandler:
         if not self._cfg.get("discovery", True):
             return
         prefix = self._cfg.get("discovery_prefix", "homeassistant")
-        device = {
-            "identifiers": ["door_access_pi"],
-            "name": "Door Access",
-            "manufacturer": "DIY",
-            "model": "Raspberry Pi Door Controller",
-        }
-        avail = {
-            "availability_topic": self.TOPIC_AVAILABILITY,
-            "payload_available": "online",
-            "payload_not_available": "offline",
-        }
+        device = self._device_block()
+        avail = self._avail_block()
         configs = {
             f"{prefix}/lock/door_access/lock/config": {
                 "name": "Lock", "unique_id": "door_access_lock",
@@ -162,6 +196,25 @@ class MQTTHandler:
                 "topic": self.TOPIC_TAG, "value_template": "{{ value }}",
                 "device": device,
             },
+            f"{prefix}/switch/door_access/enroll/config": {
+                "name": "Enroll Next Tag", "unique_id": "door_access_enroll",
+                "command_topic": self.TOPIC_ENROLL_SET, "state_topic": self.TOPIC_ENROLL_STATE,
+                "payload_on": "ON", "payload_off": "OFF", "icon": "mdi:card-plus",
+                **avail, "device": device,
+            },
+            f"{prefix}/text/door_access/enroll_name/config": {
+                "name": "New Tag Name", "unique_id": "door_access_enroll_name",
+                "command_topic": self.TOPIC_ENROLL_NAME_SET, "state_topic": self.TOPIC_ENROLL_NAME_STATE,
+                "max": 32, "icon": "mdi:rename-box",
+                **avail, "device": device,
+            },
+            f"{prefix}/select/door_access/known_tags/config": self._known_tags_discovery(),
+            f"{prefix}/button/door_access/remove_tag/config": {
+                "name": "Remove Selected Tag", "unique_id": "door_access_remove_tag",
+                "command_topic": self.TOPIC_REMOVE_PRESS, "payload_press": "PRESS",
+                "icon": "mdi:card-remove",
+                **avail, "device": device,
+            },
         }
         # One binary_sensor per door.
         for name in self._door_names:
@@ -179,6 +232,29 @@ class MQTTHandler:
         self._safe_publish(self.TOPIC_DOOR_STATE, "", retain=True)
         logger.info("Published HA MQTT discovery configs (%d entities)", len(configs))
 
+    def _device_block(self) -> dict:
+        return {
+            "identifiers": ["door_access_pi"],
+            "name": "Door Access",
+            "manufacturer": "DIY",
+            "model": "Raspberry Pi Door Controller",
+        }
+
+    def _avail_block(self) -> dict:
+        return {
+            "availability_topic": self.TOPIC_AVAILABILITY,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        }
+
+    def _known_tags_discovery(self) -> dict:
+        return {
+            "name": "Known Tags", "unique_id": "door_access_known_tags",
+            "command_topic": self.TOPIC_KNOWN_SELECT, "state_topic": self.TOPIC_KNOWN_STATE,
+            "options": self._known_options(), "icon": "mdi:card-account-details",
+            **self._avail_block(), "device": self._device_block(),
+        }
+
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             with self._connected_lock:
@@ -187,9 +263,16 @@ class MQTTHandler:
             client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=True)
             client.subscribe(self.TOPIC_LOCK_SET, qos=1)
             client.subscribe(self.TOPIC_UNLOCK_SET, qos=1)
+            client.subscribe(self.TOPIC_ENROLL_SET, qos=1)
+            client.subscribe(self.TOPIC_ENROLL_NAME_SET, qos=1)
+            client.subscribe(self.TOPIC_KNOWN_SELECT, qos=1)
+            client.subscribe(self.TOPIC_REMOVE_PRESS, qos=1)
             self._publish_discovery()
             # Publish current unlock duration so the HA number entity shows it.
             self.publish_unlock_duration(self._unlock_duration)
+            # Seed enroll/known-tag entity states (enroll always starts disarmed).
+            self.publish_enroll_state(False)
+            self.publish_known_tags()
         else:
             logger.error("MQTT connect refused (rc=%d)", rc)
 
@@ -211,6 +294,18 @@ class MQTTHandler:
                     logger.warning("Ignoring non-numeric unlock duration: %r", raw)
                     return
                 self._queue.put_nowait({"type": "SET_UNLOCK_DURATION", "seconds": seconds})
+                return
+            if message.topic == self.TOPIC_ENROLL_SET:
+                self._queue.put_nowait({"type": "SET_ENROLL_MODE", "active": raw.upper() == "ON"})
+                return
+            if message.topic == self.TOPIC_ENROLL_NAME_SET:
+                self._queue.put_nowait({"type": "SET_ENROLL_NAME", "name": raw})
+                return
+            if message.topic == self.TOPIC_KNOWN_SELECT:
+                self._queue.put_nowait({"type": "SET_SELECTED_TAG", "name": raw})
+                return
+            if message.topic == self.TOPIC_REMOVE_PRESS:
+                self._queue.put_nowait({"type": "REMOVE_SELECTED_TAG"})
                 return
             payload = raw.upper()
             if payload in ("LOCK", "UNLOCK"):

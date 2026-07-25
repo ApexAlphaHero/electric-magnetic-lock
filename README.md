@@ -218,6 +218,9 @@ sudo systemctl stop door_access
 | `home/door/last_access` | Yes | JSON (see below) |
 | `home/door/nfc/tag` | No | Raw UID of every scan (for HA's MQTT tag scanner) |
 | `home/door/unlock_duration/state` | Yes | Current unlock duration (seconds) |
+| `home/door/enroll/state` | Yes | `ON` / `OFF` — enroll mode armed state |
+| `home/door/enroll_name/state` | Yes | Name to assign the next enrolled tag |
+| `home/door/known_tags/state` | Yes | Currently selected known tag (for removal) |
 
 Discovery configs are also published (retained) under `homeassistant/.../config` when
 `mqtt.discovery` is enabled — see the Home Assistant section below.
@@ -228,6 +231,10 @@ Discovery configs are also published (retained) under `homeassistant/.../config`
 |-------|---------|
 | `home/door/lock/set` | `LOCK` or `UNLOCK` |
 | `home/door/unlock_duration/set` | Number of seconds (1–60) to set the unlock duration |
+| `home/door/enroll/set` | `ON` / `OFF` — arm (one-shot) or disarm tag enrollment |
+| `home/door/enroll_name/set` | Name to assign the next enrolled tag |
+| `home/door/known_tags/set` | Select a known tag name (for removal) |
+| `home/door/remove_tag/set` | `PRESS` — remove the currently selected known tag |
 
 ### last_access JSON format
 
@@ -248,6 +255,10 @@ Discovery configs are also published (retained) under `homeassistant/.../config`
 | `UNAUTHORIZED_ACCESS uid=...` | Unrecognized NFC UID |
 | `BUTTON_UNLOCK` | Momentary button pressed |
 | `DOOR_OPEN_TOO_LONG elapsed=...s` | Door open past threshold |
+| `TAG_ENROLLED uid=... name=...` | New tag captured via enroll mode |
+| `TAG_ALREADY_ENROLLED uid=... name=...` | Enroll scan of an already-known tag |
+| `TAG_REMOVED name=... count=...` | Tag(s) removed via **Remove Selected Tag** |
+| `TAG_REMOVE_NOMATCH name=...` | Remove pressed with no matching tag |
 
 ### Home Assistant integration
 
@@ -264,6 +275,28 @@ points at the same broker, a **"Door Access"** device shows up under
 | Last Access | `sensor` | **Who scanned** — state = name; attributes `uid`, `granted`, `timestamp` |
 | Alert | `sensor` | Latest alert string (`UNAUTHORIZED_ACCESS …`, `DOOR_OPEN_TOO_LONG …`, etc.) |
 | NFC tag scanner | `tag` | Every scan fires HA's native `tag_scanned`; badges appear under **Settings → Tags** |
+| Enroll Next Tag | `switch` | **Arm enrollment** (one-shot) — the next scanned tag is added |
+| New Tag Name | `text` | Name to assign the next enrolled tag (blank → `Tag <last4>`) |
+| Known Tags | `select` | Pick a known tag by name (options track `authorized_uids`) |
+| Remove Selected Tag | `button` | **Revoke** the tag selected in *Known Tags* |
+
+#### Enroll or remove a tag from Home Assistant
+
+Tags live in `authorized_uids` in the config, but you don't have to edit it by hand — add
+and remove tags entirely from the **Door Access** device:
+
+**Add a tag**
+1. Type the person's name into **New Tag Name** (blank defaults to `Tag <last4>`).
+2. Turn **Enroll Next Tag** ON.
+3. Scan the new tag on the reader.
+
+The Pi writes `UID → name` into the config, saves it, the reader **beeps + flashes green**,
+and the switch flips itself back OFF. The tag works immediately — no restart. Enrollment is
+one-shot and does **not** unlock the door (it's an admin action).
+
+**Remove a tag** — pick the name in **Known Tags**, then press **Remove Selected Tag**. This
+works for a lost tag too, since you select by name rather than scanning. The *Known Tags*
+options refresh automatically after any add or remove.
 
 #### Notify on a denied badge
 

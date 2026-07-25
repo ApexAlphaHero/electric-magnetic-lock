@@ -73,11 +73,33 @@ def setup_signal_handlers(shutdown_event: threading.Event) -> None:
 
 
 def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
-                config: dict, logger: logging.Logger) -> None:
+                config: dict, runtime: dict, logger: logging.Logger) -> None:
     uid = event["uid"]
     authorized = config["authorized_uids"]
     # Forward every scan to Home Assistant's MQTT tag scanner (fires tag_scanned).
     mqtt.publish_tag(uid)
+
+    # Enroll mode: the next scan captures the tag instead of unlocking. One-shot —
+    # always disarms after a scan, whether or not the tag was new.
+    if runtime["enroll_event"].is_set():
+        runtime["enroll_event"].clear()
+        mqtt.publish_enroll_state(False)
+        if uid in authorized:
+            logger.info("Enroll: UID=%s already enrolled as %s", uid, authorized[uid])
+            mqtt.publish_alert(f"TAG_ALREADY_ENROLLED uid={uid} name={authorized[uid]}")
+        else:
+            name = (runtime.get("enroll_name") or "").strip() or f"Tag {uid[-4:]}"
+            authorized[uid] = name
+            try:
+                save_config(config)
+            except Exception as e:
+                logger.error("Failed to persist enrolled tag: %s", e)
+            mqtt.publish_known_tags()
+            mqtt.publish_last_access(uid=uid, name=name, granted=True)
+            mqtt.publish_alert(f"TAG_ENROLLED uid={uid} name={name}")
+            logger.info("Tag ENROLLED: UID=%s Name=%s", uid, name)
+        return
+
     if uid in authorized:
         name = authorized[uid]
         lock_ctrl.unlock()  # uses the controller's current default duration
@@ -140,11 +162,57 @@ def _handle_set_unlock_duration(event: dict, lock_ctrl: LockController, mqtt: MQ
     logger.info("Unlock duration set to %.0fs", seconds)
 
 
+def _handle_set_enroll_mode(event: dict, mqtt: MQTTHandler, runtime: dict,
+                            logger: logging.Logger) -> None:
+    active = bool(event["active"])
+    if active:
+        runtime["enroll_event"].set()
+    else:
+        runtime["enroll_event"].clear()
+    mqtt.publish_enroll_state(active)
+    logger.info("Enroll mode %s (name=%r)", "ARMED" if active else "OFF", runtime.get("enroll_name", ""))
+
+
+def _handle_set_enroll_name(event: dict, mqtt: MQTTHandler, runtime: dict,
+                            logger: logging.Logger) -> None:
+    runtime["enroll_name"] = event["name"]
+    mqtt.publish_enroll_name(event["name"])
+    logger.info("Enroll name set to %r", event["name"])
+
+
+def _handle_set_selected_tag(event: dict, mqtt: MQTTHandler, runtime: dict,
+                             logger: logging.Logger) -> None:
+    runtime["selected_tag"] = event["name"]
+    mqtt.publish_selected_tag(event["name"])
+    logger.debug("Selected tag for removal: %r", event["name"])
+
+
+def _handle_remove_selected_tag(mqtt: MQTTHandler, config: dict, runtime: dict,
+                                logger: logging.Logger) -> None:
+    name = runtime.get("selected_tag", "")
+    authorized = config["authorized_uids"]
+    to_remove = [u for u, n in authorized.items() if n == name]
+    if not name or name == MQTTHandler.NO_TAGS or not to_remove:
+        logger.warning("Remove tag: no match for selection %r", name)
+        mqtt.publish_alert(f"TAG_REMOVE_NOMATCH name={name}")
+        return
+    for u in to_remove:
+        del authorized[u]
+    try:
+        save_config(config)
+    except Exception as e:
+        logger.error("Failed to persist tag removal: %s", e)
+    runtime["selected_tag"] = ""
+    mqtt.publish_known_tags()
+    mqtt.publish_alert(f"TAG_REMOVED name={name} count={len(to_remove)}")
+    logger.info("Removed %d tag(s) named %r", len(to_remove), name)
+
+
 def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
-                   config: dict, logger: logging.Logger) -> None:
+                   config: dict, runtime: dict, logger: logging.Logger) -> None:
     etype = event["type"]
     if etype == "NFC_UID":
-        _handle_nfc(event, lock_ctrl, mqtt, config, logger)
+        _handle_nfc(event, lock_ctrl, mqtt, config, runtime, logger)
     elif etype == "BUTTON_PRESS":
         _handle_button(lock_ctrl, mqtt, config, logger)
     elif etype == "MQTT_COMMAND":
@@ -155,6 +223,14 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
         _handle_door_alert(event, mqtt, logger)
     elif etype == "SET_UNLOCK_DURATION":
         _handle_set_unlock_duration(event, lock_ctrl, mqtt, config, logger)
+    elif etype == "SET_ENROLL_MODE":
+        _handle_set_enroll_mode(event, mqtt, runtime, logger)
+    elif etype == "SET_ENROLL_NAME":
+        _handle_set_enroll_name(event, mqtt, runtime, logger)
+    elif etype == "SET_SELECTED_TAG":
+        _handle_set_selected_tag(event, mqtt, runtime, logger)
+    elif etype == "REMOVE_SELECTED_TAG":
+        _handle_remove_selected_tag(mqtt, config, runtime, logger)
     elif etype == "UNLOCK_TIMER_EXPIRED":
         lock_ctrl.lock()
         mqtt.publish_lock_state("LOCKED")
@@ -165,12 +241,12 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
 
 def run_event_loop(event_queue: queue.Queue, shutdown_event: threading.Event,
                    lock_ctrl: LockController, mqtt: MQTTHandler,
-                   config: dict, logger: logging.Logger) -> None:
+                   config: dict, runtime: dict, logger: logging.Logger) -> None:
     logger.info("Event loop started")
     while not shutdown_event.is_set():
         try:
             event = event_queue.get(timeout=1.0)
-            dispatch_event(event, lock_ctrl, mqtt, config, logger)
+            dispatch_event(event, lock_ctrl, mqtt, config, runtime, logger)
         except queue.Empty:
             continue
         except Exception:
@@ -206,10 +282,18 @@ def main() -> None:
     event_queue: queue.Queue = queue.Queue(maxsize=100)
     setup_signal_handlers(shutdown_event)
 
+    # Runtime-only state for HA-driven tag enrollment/removal (never persisted).
+    # enroll_event is shared with the NFC reader so an armed scan flashes green.
+    runtime: dict = {
+        "enroll_event": threading.Event(),
+        "enroll_name": "",
+        "selected_tag": "",
+    }
+
     mqtt_handler = MQTTHandler(event_queue, config, shutdown_event)
     lock_ctrl = LockController(event_queue, config, shutdown_event)
     door_sensors = _build_door_sensors(event_queue, config, shutdown_event)
-    nfc_reader = NFCReader(event_queue, config, shutdown_event)
+    nfc_reader = NFCReader(event_queue, config, shutdown_event, runtime["enroll_event"])
 
     try:
         lock_ctrl.setup()
@@ -219,7 +303,7 @@ def main() -> None:
         mqtt_handler.setup()
         mqtt_handler.connect()
         nfc_reader.start()
-        run_event_loop(event_queue, shutdown_event, lock_ctrl, mqtt_handler, config, logger)
+        run_event_loop(event_queue, shutdown_event, lock_ctrl, mqtt_handler, config, runtime, logger)
     finally:
         logger.info("Shutdown initiated")
         nfc_reader.stop()
