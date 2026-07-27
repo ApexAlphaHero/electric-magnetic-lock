@@ -26,15 +26,31 @@
     </div>
   </form>
 
-  {# Shown only where the Web NFC API actually exists — Chrome on Android over
-     HTTPS. static/nfc.js unhides it. #}
-  <div id="nfc-panel" class="nfc hidden">
-    <button type="button" id="nfc-scan">Scan a tag with this phone</button>
-    <span id="nfc-status" class="muted small"></span>
+  {# The door reader is the default: it needs no browser support, no
+     certificate trust, and works on any device. Phone scanning is layered on
+     top only where the Web NFC API genuinely exists. #}
+  <div class="scanrow">
+    <button type="button" id="reader-scan" class="primary" data-csrf="{{ csrf }}">
+      Scan at the door reader
+    </button>
+    <button type="button" id="reader-cancel" class="hidden" data-csrf="{{ csrf }}">Cancel</button>
+    <button type="button" id="nfc-scan" class="hidden">Scan with this phone</button>
+    <span id="scan-status" class="muted small" role="status" aria-live="polite"></span>
   </div>
+
+  <p class="muted small">
+    <strong>Scan at the door reader</strong> arms the Pi's reader for 60 seconds — hold the
+    tag to it and it's added under the name above. It won't unlock the door while armed.
+  </p>
+
   <p id="nfc-unsupported" class="muted small hidden">
-    This browser has no NFC access. Scan the tag at the door reader and pick it up
-    from <em>Recent unknown scans</em> below, or type the UID in by hand.
+    Phone scanning isn't available here. <span id="nfc-reason"></span>
+    <span id="nfc-ca" class="hidden">
+      <a href="{{ url_for('ca_certificate') }}">Download this site's CA certificate</a> and
+      install it under <em>Settings → Security → Encryption &amp; credentials → Install a
+      certificate → CA certificate</em>.
+    </span>
+    The door reader button above works regardless.
   </p>
 </div>
 

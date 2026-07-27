@@ -24,8 +24,8 @@ import secrets
 import threading
 import time
 
-from flask import (Flask, abort, flash, redirect, render_template, request,
-                   session, url_for)
+from flask import (Flask, Response, abort, flash, jsonify, redirect,
+                   render_template, request, session, url_for)
 
 from control_socket import DEFAULT_SOCKET_PATH, ControlClient, normalize_uid
 from event_store import DEFAULT_DB_PATH, EventReader
@@ -43,6 +43,7 @@ DEFAULTS = {
     "allow_unlock": True,
     "control_socket": DEFAULT_SOCKET_PATH,
     "event_db": DEFAULT_DB_PATH,
+    "tls_ca": "/etc/door_access/tls/ca.pem",
     "page_size": 50,
     "max_login_attempts": 5,
     "lockout_minutes": 15,
@@ -247,6 +248,34 @@ def create_app(cfg: dict | None = None) -> Flask:
 
     # ── auth routes ────────────────────────────────────────────────────────────
 
+    @app.route("/ca.crt")
+    def ca_certificate():
+        """Serve the local CA certificate so a device can be taught to trust this site.
+
+        Deliberately unauthenticated. You need this certificate *before* the
+        connection is trustworthy, so requiring a login first would mean sending
+        a password over a connection whose certificate you have not yet verified
+        — the exact thing installing the CA is meant to fix.
+
+        Publishing it grants nobody anything: a CA certificate is a public key.
+        The private key that could actually sign certificates (ca-key.pem) is
+        0640 root:dooradmin and is never served.
+
+        Sent as .crt with the x509 MIME type because Android's certificate
+        installer filters the file picker by extension and skips .pem.
+        """
+        try:
+            with open(cfg["tls_ca"], "rb") as f:
+                pem = f.read()
+        except OSError as e:
+            logger.error("Cannot read CA certificate %s: %s", cfg["tls_ca"], e)
+            abort(404)
+        return Response(
+            pem,
+            mimetype="application/x-x509-ca-cert",
+            headers={"Content-Disposition": 'attachment; filename="door-access-ca.crt"'},
+        )
+
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "GET":
@@ -401,6 +430,30 @@ def create_app(cfg: dict | None = None) -> Flask:
         else:
             flash(f"Could not add tag: {result.get('error')}", "error")
         return redirect(url_for("tags"))
+
+    # ── enrollment via the door reader ─────────────────────────────────────────
+    # These two are fetch/JSON rather than form-and-redirect: the operator walks
+    # to the door after arming, so the page has to report the outcome without a
+    # navigation they aren't there to perform.
+
+    @app.route("/tags/arm", methods=["POST"])
+    @login_required
+    def arm_enroll():
+        require_csrf()
+        result = door.call("arm_enroll", name=request.form.get("name", ""),
+                           actor=current_user())
+        return jsonify(result), 200 if result.get("ok") else 502
+
+    @app.route("/tags/enroll_status")
+    @login_required
+    def enroll_status():
+        return jsonify(door.call("enroll_status", actor=current_user()))
+
+    @app.route("/tags/cancel_arm", methods=["POST"])
+    @login_required
+    def cancel_enroll():
+        require_csrf()
+        return jsonify(door.call("cancel_enroll", actor=current_user()))
 
     @app.route("/tags/remove", methods=["POST"])
     @login_required

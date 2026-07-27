@@ -31,12 +31,17 @@ LED_OFF, LED_BLUE, LED_GREEN = 0x00, 0x01, 0x02
 
 
 class NFCReader:
-    def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
+    def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event,
+                 enroll_event: threading.Event | None = None):
         self._queue = event_queue
         self._debounce_seconds: float = config["nfc"]["uid_debounce_seconds"]
         self._authorized = config.get("authorized_uids", {})
         self._feedback_enabled: bool = config.get("reader_feedback", {}).get("enabled", True)
         self._shutdown = shutdown_event
+        # Set while the web admin has armed enrollment; makes an unknown tag
+        # flash green ("captured") rather than the blue "denied" blink, so the
+        # person at the door gets the right signal.
+        self._enroll_event = enroll_event
         self._last_uid: str | None = None
         self._last_uid_time: float = 0.0
         self._thread: threading.Thread | None = None
@@ -80,7 +85,9 @@ class NFCReader:
                 if uid:
                     # Physical feedback on every successful read; LED colour
                     # reflects authorization (debounce only gates the event).
-                    self._signal_read(cardservice.connection, uid in self._authorized)
+                    enrolling = self._enroll_event is not None and self._enroll_event.is_set()
+                    self._signal_read(cardservice.connection,
+                                      uid in self._authorized or enrolling)
                     if not self._is_debounced(uid):
                         self._last_uid = uid
                         self._last_uid_time = time.monotonic()

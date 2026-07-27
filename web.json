@@ -9,5 +9,8 @@
   "page_size": 50,
 
   "control_socket": "/run/door_access/control.sock",
-  "event_db": "/var/lib/door_access/events.db"
+  "event_db": "/var/lib/door_access/events.db",
+
+  "_tls_ca": "Public CA certificate, served unauthenticated at /ca.crt so a device can be taught to trust this site. The signing key (ca-key.pem) is never served.",
+  "tls_ca": "/etc/door_access/tls/ca.pem"
 }

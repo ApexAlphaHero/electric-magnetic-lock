@@ -263,24 +263,47 @@ your username. An unlock already counting down keeps its original timer.
 
 ### Adding a tag
 
-Three ways, all on the **Tags** page:
+All on the **Tags** page. Type a name first — a blank name becomes `Tag <last 4>`.
 
-1. **From a recent unknown scan** *(no setup)* — present the card at the door reader. It's
-   denied and logged; the UID then appears under *Recent unknown scans*. Click **Use this
-   UID**, type a name, **Add tag**.
-2. **With your phone's NFC** *(Chrome on Android)* — tap **Scan a tag with this phone** and
-   hold the card to the back of the phone. The UID fills itself in.
-3. **By hand** — type the UID. Any separator style works; `aa:bb:11:22` and `AABB1122` are
+1. **Scan at the door reader** — *the default, works everywhere.* Press the button, walk to
+   the door, hold the tag to the reader. It's captured and added under the name you typed;
+   the page updates itself. Uses the Pi's own ACR1552, so it needs nothing from the
+   browser — no NFC hardware, no certificate trust, works on iPhone and Firefox alike.
+2. **Scan with this phone** — *only appears where it can actually work.* See the note below.
+3. **From a recent unknown scan** — a tag presented at the door and denied is logged; click
+   **Use this UID** under *Recent unknown scans*.
+4. **By hand** — type the UID. Any separator style works; `aa:bb:11:22` and `AABB1122` are
    the same tag.
 
 Changes take effect immediately — no restart.
 
-> **Phone NFC needs the CA installed.** The Web NFC API only exists in Chrome on Android,
-> and only in a secure context. With the self-signed setup the installer generates, that
-> means installing `/etc/door_access/tls/ca.pem` on the phone first
-> (**Settings → Security → Encryption & credentials → Install a certificate → CA
-> certificate**). Until then the button simply doesn't appear. **iOS cannot do this at
-> all** — Safari does not implement Web NFC — so on an iPhone use method 1 or 3.
+While the reader is armed it will **not** open the door: the scan is treated as an admin
+capture, and the reader flashes green to confirm. The arm is one-shot and expires after 60
+seconds, so a forgotten arm can't sit there swallowing legitimate unlocks. There's a
+**Cancel** button, and the countdown is shown while it's waiting.
+
+> **Phone scanning is optional and often unavailable.** Web NFC exists only in Chromium
+> browsers on Android (Chrome, Edge, Samsung Internet) *and* only in a trusted secure
+> context. **Firefox does not implement it on any platform, and no iOS browser has it** —
+> Mozilla and Apple have both declined to ship it. If the certificate is the only thing
+> missing, the page says so and links the CA download; if the browser is the problem, it
+> says that instead. Either way the door-reader button above is unaffected.
+
+### Trusting the site's certificate
+
+The installer generates a local CA and signs the web admin's certificate with it, so
+browsers warn until that CA is installed. Grab it from the **Certificate** link in the nav
+(or `https://<pi-ip>:8443/ca.crt`) and install it:
+
+- **Android** — Settings → Security → Encryption & credentials → Install a certificate → CA certificate
+- **Windows** — double-click → Install Certificate → Local Machine → Trusted Root Certification Authorities
+- **iOS** — Settings → General → VPN & Device Management → install, then Settings → General → About → Certificate Trust Settings → enable it
+
+The download is deliberately **unauthenticated**: you need the certificate *before* the
+connection is trustworthy, and requiring a login first would mean sending your password
+over a connection you haven't verified. A CA certificate is a public key — publishing it
+grants nobody anything. The signing key (`ca-key.pem`) is `0640 root:dooradmin` and is
+never served.
 
 ### Event history
 

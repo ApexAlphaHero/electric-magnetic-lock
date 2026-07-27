@@ -19,6 +19,10 @@ from nfc_reader import NFCReader
 
 CONFIG_PATH = "/etc/door_access/config.json"
 PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
+# How long the door reader stays armed to capture a tag after the web admin
+# arms it. Long enough to walk to the door, short enough that a forgotten arm
+# doesn't sit there swallowing a legitimate unlock.
+ENROLL_WINDOW_SECONDS = 60
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -101,11 +105,19 @@ def setup_signal_handlers(shutdown_event: threading.Event) -> None:
 
 
 def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
-                config: dict, events: EventStore, logger: logging.Logger) -> None:
+                config: dict, events: EventStore, runtime: dict,
+                logger: logging.Logger) -> None:
     uid = event["uid"]
     authorized = config["authorized_uids"]
     # Forward every scan to Home Assistant's MQTT tag scanner (fires tag_scanned).
     mqtt.publish_tag(uid)
+
+    # Enrollment armed from the web admin: this scan captures the tag instead of
+    # opening the door. One-shot — it disarms whatever the outcome, so a forgotten
+    # arm can never leave the reader in capture mode.
+    if runtime["enroll_event"].is_set():
+        _capture_tag(uid, config, events, runtime, mqtt, logger)
+        return
 
     if uid in authorized:
         name = authorized[uid]
@@ -122,6 +134,42 @@ def _handle_nfc(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
         # enrollment ("click a recent unknown scan").
         events.log("ACCESS_DENIED", uid=uid, name="Unknown", granted=False)
         logger.warning("Access DENIED: UID=%s", uid)
+
+
+def _disarm_enroll(runtime: dict) -> None:
+    runtime["enroll_event"].clear()
+    runtime["enroll_deadline"] = 0.0
+
+
+def _capture_tag(uid: str, config: dict, events: EventStore, runtime: dict,
+                 mqtt: MQTTHandler, logger: logging.Logger) -> None:
+    """Record a tag scanned at the door reader while enrollment was armed.
+
+    Result is stashed in runtime for the web UI to collect on its next poll —
+    the operator is standing at the door, not at the browser, so the outcome has
+    to survive until they look."""
+    authorized = config["authorized_uids"]
+    actor = runtime.get("enroll_actor", "?")
+    _disarm_enroll(runtime)
+
+    if uid in authorized:
+        runtime["enroll_result"] = {"status": "already", "uid": uid, "name": authorized[uid]}
+        events.log("TAG_SCAN_DUPLICATE", uid=uid, name=authorized[uid], actor=actor)
+        logger.info("Enroll scan: UID=%s already enrolled as %s", uid, authorized[uid])
+        return
+
+    name = (runtime.get("enroll_name") or "").strip()[:64] or f"Tag {uid[-4:]}"
+    authorized[uid] = name
+    if not _persist(config, logger):
+        del authorized[uid]
+        runtime["enroll_result"] = {"status": "error", "uid": uid,
+                                    "error": "could not write config — tag not added"}
+        return
+
+    runtime["enroll_result"] = {"status": "added", "uid": uid, "name": name}
+    events.log("TAG_ADDED", uid=uid, name=name, actor=actor, detail="scanned at door reader")
+    mqtt.publish_alert(f"TAG_ADDED uid={uid} name={name}")
+    logger.info("Tag ADDED by %s via reader: UID=%s Name=%s", actor, uid, name)
 
 
 def _handle_button(lock_ctrl: LockController, mqtt: MQTTHandler,
@@ -158,14 +206,16 @@ def _handle_door_alert(event: dict, mqtt: MQTTHandler, events: EventStore,
 # the username it authenticated, recorded for the audit trail.
 
 def _handle_web_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
-                        config: dict, events: EventStore, logger: logging.Logger) -> None:
+                        config: dict, events: EventStore, runtime: dict,
+                        logger: logging.Logger) -> None:
     request = event.get("request", {})
     reply: queue.Queue = event["reply"]
     cmd = request.get("cmd", "")
     actor = str(request.get("actor", "?"))[:64]
 
     try:
-        response = _run_web_command(cmd, request, actor, lock_ctrl, mqtt, config, events, logger)
+        response = _run_web_command(cmd, request, actor, lock_ctrl, mqtt, config,
+                                    events, runtime, logger)
     except Exception as e:
         logger.exception("Web command %r failed", cmd)
         response = {"ok": False, "error": str(e)}
@@ -178,8 +228,35 @@ def _handle_web_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandle
 
 def _run_web_command(cmd: str, request: dict, actor: str, lock_ctrl: LockController,
                      mqtt: MQTTHandler, config: dict, events: EventStore,
-                     logger: logging.Logger) -> dict:
+                     runtime: dict, logger: logging.Logger) -> dict:
     authorized = config["authorized_uids"]
+
+    if cmd == "arm_enroll":
+        runtime["enroll_name"] = str(request.get("name", ""))[:64]
+        runtime["enroll_actor"] = actor
+        runtime["enroll_result"] = None
+        runtime["enroll_deadline"] = time.monotonic() + ENROLL_WINDOW_SECONDS
+        # Setting the event last means the reader thread never sees it armed
+        # with a stale name or deadline.
+        runtime["enroll_event"].set()
+        events.log("ENROLL_ARMED", actor=actor, name=runtime["enroll_name"] or None)
+        logger.info("Reader armed for enrollment by %s (name=%r)", actor, runtime["enroll_name"])
+        return {"ok": True, "result": {"armed": True, "seconds": ENROLL_WINDOW_SECONDS}}
+
+    if cmd == "enroll_status":
+        armed = runtime["enroll_event"].is_set()
+        remaining = max(0, int(runtime["enroll_deadline"] - time.monotonic())) if armed else 0
+        # Hand the result over exactly once; the browser acts on it and the next
+        # poll must not replay a stale capture.
+        result, runtime["enroll_result"] = runtime["enroll_result"], None
+        return {"ok": True, "result": {"armed": armed, "remaining": remaining,
+                                       "capture": result}}
+
+    if cmd == "cancel_enroll":
+        _disarm_enroll(runtime)
+        runtime["enroll_result"] = None
+        logger.info("Reader disarmed by %s", actor)
+        return {"ok": True, "result": {"armed": False}}
 
     if cmd == "status":
         return {"ok": True, "result": {
@@ -294,10 +371,11 @@ def _persist(config: dict, logger: logging.Logger) -> bool:
 
 
 def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
-                   config: dict, events: EventStore, logger: logging.Logger) -> None:
+                   config: dict, events: EventStore, runtime: dict,
+                   logger: logging.Logger) -> None:
     etype = event["type"]
     if etype == "NFC_UID":
-        _handle_nfc(event, lock_ctrl, mqtt, config, events, logger)
+        _handle_nfc(event, lock_ctrl, mqtt, config, events, runtime, logger)
     elif etype == "BUTTON_PRESS":
         _handle_button(lock_ctrl, mqtt, config, events, logger)
     elif etype == "DOOR_STATE":
@@ -305,7 +383,7 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
     elif etype == "DOOR_ALERT":
         _handle_door_alert(event, mqtt, events, logger)
     elif etype == "WEB_COMMAND":
-        _handle_web_command(event, lock_ctrl, mqtt, config, events, logger)
+        _handle_web_command(event, lock_ctrl, mqtt, config, events, runtime, logger)
     elif etype == "UNLOCK_TIMER_EXPIRED":
         lock_ctrl.lock()
         mqtt.publish_lock_state("LOCKED")
@@ -316,16 +394,24 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
 
 def run_event_loop(event_queue: queue.Queue, shutdown_event: threading.Event,
                    lock_ctrl: LockController, mqtt: MQTTHandler,
-                   config: dict, events: EventStore, logger: logging.Logger) -> None:
+                   config: dict, events: EventStore, runtime: dict,
+                   logger: logging.Logger) -> None:
     logger.info("Event loop started")
     last_prune = time.monotonic()
     while not shutdown_event.is_set():
         if time.monotonic() - last_prune >= PRUNE_INTERVAL_SECONDS:
             last_prune = time.monotonic()
             events.prune()
+        # Expire a forgotten arm here rather than lazily on the next scan, so the
+        # reader's LED stops showing enroll feedback the moment the window closes.
+        if (runtime["enroll_event"].is_set()
+                and time.monotonic() > runtime["enroll_deadline"]):
+            _disarm_enroll(runtime)
+            runtime["enroll_result"] = {"status": "timeout"}
+            logger.info("Enrollment window expired without a scan")
         try:
             event = event_queue.get(timeout=1.0)
-            dispatch_event(event, lock_ctrl, mqtt, config, events, logger)
+            dispatch_event(event, lock_ctrl, mqtt, config, events, runtime, logger)
         except queue.Empty:
             continue
         except Exception:
@@ -361,6 +447,17 @@ def main() -> None:
     event_queue: queue.Queue = queue.Queue(maxsize=100)
     setup_signal_handlers(shutdown_event)
 
+    # Enrollment state: runtime only, never persisted. enroll_event is shared
+    # with the NFC reader thread so an armed scan flashes green at the door
+    # instead of the blue "denied" blink.
+    runtime: dict = {
+        "enroll_event": threading.Event(),
+        "enroll_name": "",
+        "enroll_actor": "",
+        "enroll_deadline": 0.0,
+        "enroll_result": None,
+    }
+
     web_cfg = config.get("web", {})
     events = EventStore(
         web_cfg.get("event_db", "/var/lib/door_access/events.db"),
@@ -369,7 +466,7 @@ def main() -> None:
     mqtt_handler = MQTTHandler(config, shutdown_event)
     lock_ctrl = LockController(event_queue, config, shutdown_event)
     door_sensors = _build_door_sensors(event_queue, config, shutdown_event)
-    nfc_reader = NFCReader(event_queue, config, shutdown_event)
+    nfc_reader = NFCReader(event_queue, config, shutdown_event, runtime["enroll_event"])
     control = ControlSocket(
         event_queue, shutdown_event,
         web_cfg.get("control_socket", "/run/door_access/control.sock"),
@@ -393,7 +490,7 @@ def main() -> None:
                 # The web admin is an add-on; the door must still work without it.
                 logger.error("Control socket unavailable (%s) — web admin disabled", e)
         run_event_loop(event_queue, shutdown_event, lock_ctrl, mqtt_handler,
-                       config, events, logger)
+                       config, events, runtime, logger)
     finally:
         logger.info("Shutdown initiated")
         control.stop()
