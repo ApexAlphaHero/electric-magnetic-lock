@@ -1,0 +1,30 @@
+// Installed to /etc/polkit-1/rules.d/50-door-update.rules
+//
+// Lets the unprivileged `doorweb` web service ask systemd to start the two
+// updater units — and nothing else. It may not stop, restart, disable or
+// otherwise touch any unit, including its own or door_access.
+//
+// polkit rather than sudo because door_admin.service sets NoNewPrivileges=yes,
+// which blocks setuid binaries outright; sudo cannot run under it at all.
+// systemctl talks to PID 1 over D-Bus and is authorized here instead, so the
+// hardening stays on. This mirrors the pcscd rule in 50-door-pcsc.rules.
+//
+// Understand the boundary this creates: starting door_update.service runs code
+// from the configured git remote as root, so a dooradmin web session is
+// effectively root on this machine. update.sh refuses any other remote, and
+// "allow_update": false in web.json removes the trigger entirely.
+
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return;
+    }
+    if (subject.user !== "doorweb") {
+        return;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (verb === "start" &&
+        (unit === "door_update.service" || unit === "door_update_check.service")) {
+        return polkit.Result.YES;
+    }
+});

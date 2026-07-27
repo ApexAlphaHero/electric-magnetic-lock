@@ -24,7 +24,8 @@ SERVICE_FILE="/etc/systemd/system/door_access.service"
 WEB_SERVICE_FILE="/etc/systemd/system/door_admin.service"
 UPDATE_SERVICE_FILE="/etc/systemd/system/door_update.service"
 UPDATE_CHECK_SERVICE_FILE="/etc/systemd/system/door_update_check.service"
-SUDOERS_FILE="/etc/sudoers.d/door_update"
+UPDATE_POLKIT_RULE="/etc/polkit-1/rules.d/50-door-update.rules"
+SUDOERS_FILE="/etc/sudoers.d/door_update"   # superseded; removed if present
 POLKIT_RULE="/etc/polkit-1/rules.d/50-door-pcsc.rules"
 CCID_PLIST="/etc/libccid_Info.plist"
 ADMIN_GROUP="dooradmin"
@@ -490,21 +491,21 @@ install_updater() {
     download "$UPDATE_CHECK_SERVICE_FILE" "$REPO/door_update_check.service"
     chmod 644 "$UPDATE_SERVICE_FILE" "$UPDATE_CHECK_SERVICE_FILE"
 
-    # sudoers: validate before installing. A malformed file in sudoers.d can
-    # break sudo for every user on the machine, so it is checked in a temporary
-    # location first and only then moved into place.
-    info "Installing sudoers rule for the updater ..."
-    local tmp_sudoers
-    tmp_sudoers="$(mktemp)"
-    download "$tmp_sudoers" "$REPO/door-update.sudoers"
-    chmod 440 "$tmp_sudoers"
-    if visudo -c -f "$tmp_sudoers" >/dev/null 2>&1; then
-        install -m 440 -o root -g root "$tmp_sudoers" "$SUDOERS_FILE"
-        info "Updater sudoers rule installed"
-    else
-        warn "sudoers rule failed validation — NOT installed; the Updates page will not work"
+    # polkit, not sudo: door_admin.service runs with NoNewPrivileges=yes, which
+    # blocks setuid binaries, so sudo cannot work there at all. systemctl talks
+    # to PID 1 over D-Bus and is authorized by this rule instead.
+    info "Installing polkit rule for the updater ..."
+    download "$UPDATE_POLKIT_RULE" "$REPO/door-update.rules"
+    chmod 644 "$UPDATE_POLKIT_RULE"
+    systemctl restart polkit || true
+
+    # Remove the sudoers grant shipped by an earlier version. It is no longer
+    # used, and leaving it behind would keep a privilege the design no longer
+    # relies on.
+    if [[ -f "$SUDOERS_FILE" ]]; then
+        info "Removing superseded sudoers rule ..."
+        rm -f "$SUDOERS_FILE"
     fi
-    rm -f "$tmp_sudoers"
 
     systemctl daemon-reload
 }

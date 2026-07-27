@@ -46,7 +46,9 @@ Flask + gunicorn (TLS), runs as `doorweb`, separate from the door service. Depen
 
 `/opt/door_access/repo` is a root-owned git checkout — the *source* the updater installs from, not the running code (that stays in `/opt/door_access`). Keep it root-owned and non-group-writable: write access there is equivalent to root, since `update.sh` installs from it.
 
-The web app has **no** privilege to install anything. It shells out to `sudo -n systemctl start door_update{,_check}.service` and otherwise only reads the status JSON and log those units write. Everything else — fetch, merge, install, restart — happens as root inside `update.sh`.
+The web app has **no** privilege to install anything. It runs `systemctl --no-block start door_update{,_check}.service` and otherwise only reads the status JSON and log those units write. Everything else — fetch, merge, install, restart — happens as root inside `update.sh`.
+
+**Authorization is polkit, not sudo** — `door_admin.service` sets `NoNewPrivileges=yes`, which blocks setuid binaries, so sudo cannot run there at all. Don't "fix" a permission error by removing that hardening; extend `50-door-update.rules` instead. `--no-block` is required because both units are `Type=oneshot`: without it `systemctl start` waits for the entire update and the HTTP request times out.
 
 - **Auto-rollback is the point.** If `door_access` isn't active after the restart, `update.sh` resets to the previous commit, reinstalls, and restarts. A broken release must never leave the door unmanaged. Preserve this if you touch the script.
 - **`--ff-only` and a pinned remote.** It refuses a non-fast-forward (so hand-edits on the Pi fail loudly rather than being discarded) and refuses any origin but the configured URL (otherwise rewriting the remote turns the update button into arbitrary root execution).
@@ -81,7 +83,7 @@ SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main threa
 | `door_admin.service` | systemd unit — runs as `doorweb`, gunicorn + TLS, hardened, `SupplementaryGroups=shadow dooradmin` |
 | `update.sh` | Privileged updater — fetch, ff-only merge, reinstall, restart, auto-rollback. Run as root by the units below, never by the web app |
 | `door_update.service` / `door_update_check.service` | Oneshot root units: apply / check. Separate so "may check" and "may apply" are distinct capabilities |
-| `door-update.sudoers` | → `/etc/sudoers.d/door_update`. Lets `doorweb` start exactly those two units and nothing else |
+| `door-update.rules` | → `/etc/polkit-1/rules.d/50-door-update.rules`. Lets `doorweb` start exactly those two units and nothing else |
 | `install.sh` | apt deps (incl. rpi-lgpio), venv, CCID escape, users/groups, polkit rule, local CA + TLS cert, dirs, installs files, enables both services. `DOOR_SRC_DIR=<path>` installs from a local checkout instead of GitHub |
 | `README.md` | Wiring, setup, MQTT topic reference, HA config examples |
 

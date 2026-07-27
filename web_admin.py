@@ -528,13 +528,25 @@ def create_app(cfg: dict | None = None) -> Flask:
                     "behind": 0, "pending": []}
 
     def start_unit(unit: str) -> dict:
+        """Ask systemd to start one of the updater units.
+
+        No sudo: this service runs with NoNewPrivileges=yes, which blocks setuid
+        binaries outright. systemctl reaches PID 1 over D-Bus and is authorized
+        by /etc/polkit-1/rules.d/50-door-update.rules, which permits starting
+        exactly these two units and nothing else.
+
+        --no-block because both are Type=oneshot: without it systemctl waits for
+        the whole update to finish and the request would time out.
+        """
         try:
             done = subprocess.run(
-                ["sudo", "-n", "/usr/bin/systemctl", "start", unit],
+                ["systemctl", "--no-block", "start", unit],
                 capture_output=True, text=True, timeout=30,
             )
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": f"{unit} did not start within 30s"}
+        except FileNotFoundError:
+            return {"ok": False, "error": "systemctl not found"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if done.returncode != 0:
