@@ -1,0 +1,21 @@
+{# Shared by the dashboard and the history page. Expects `events`. #}
+<div class="scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>When (UTC)</th><th>Event</th><th>Who</th><th>UID</th><th>Details</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in events %}
+        <tr class="{{ 'denied' if e.type == 'ACCESS_DENIED' }}">
+          <td class="mono nowrap">{{ e.ts|replace('T', ' ')|replace('+00:00', '') }}</td>
+          <td><span class="tag t-{{ e.type|lower }}">{{ e.type|replace('_', ' ')|title }}</span></td>
+          <td>{{ e.name or e.actor or '—' }}</td>
+          <td class="mono">{{ e.uid or '—' }}</td>
+          <td class="muted">{{ e.door or '' }}{% if e.door and e.detail %} · {% endif %}{{ e.detail or '' }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

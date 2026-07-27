@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Door Access Control — installer
 # Run as root:  sudo bash install.sh
-# Or one-liner: curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main/install.sh | sudo bash
+# Or one-liner: curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/master/install.sh | sudo bash
 #
 # Target: Raspberry Pi OS / Debian 13 (trixie) or newer, Python >= 3.10.
 # On Debian 12+ PEP 668 blocks `pip install` into the system interpreter, so all
@@ -9,14 +9,21 @@
 
 set -euo pipefail
 
-REPO="https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main"
+REPO="https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/master"
 APP_DIR="/opt/door_access"
 CFG_DIR="/etc/door_access"
 LOG_DIR="/var/log/door_access"
 LOG_FILE="$LOG_DIR/door_access.log"
+DATA_DIR="/var/lib/door_access"
+TLS_DIR="$CFG_DIR/tls"
+VENV_DIR="$APP_DIR/venv"
 SERVICE_FILE="/etc/systemd/system/door_access.service"
+WEB_SERVICE_FILE="/etc/systemd/system/door_admin.service"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-door-pcsc.rules"
 CCID_PLIST="/etc/libccid_Info.plist"
+ADMIN_GROUP="dooradmin"
+WEB_USER="doorweb"
+WEB_PORT="${DOOR_WEB_PORT:-8443}"
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -31,8 +38,22 @@ require_root() {
     fi
 }
 
+# Set DOOR_SRC_DIR to install from a local checkout instead of GitHub — used for
+# deploying unreleased changes, and for installing on a Pi with no internet.
+SRC_DIR="${DOOR_SRC_DIR:-}"
+
 download() {
     local dest="$1" url="$2"
+    if [[ -n "$SRC_DIR" ]]; then
+        local rel="${url#"$REPO"/}"
+        if [[ ! -f "$SRC_DIR/$rel" ]]; then
+            error "$SRC_DIR/$rel not found"
+            exit 1
+        fi
+        info "Installing $rel from $SRC_DIR ..."
+        install -D -m 644 "$SRC_DIR/$rel" "$dest"
+        return
+    fi
     info "Downloading $(basename "$dest") ..."
     curl -fsSL "$url" -o "$dest"
 }
@@ -53,11 +74,41 @@ install_packages() {
         libpcsclite-dev \
         python3-pyscard \
         python3-paho-mqtt \
-        python3-rpi-lgpio
+        python3-rpi-lgpio \
+        python3-venv \
+        libpam0g-dev \
+        openssl
 
     info "Enabling pcscd ..."
     systemctl enable pcscd
     systemctl start pcscd
+}
+
+# ── 1b. Web admin virtualenv ─────────────────────────────────────────────────────
+
+create_venv() {
+    # The web admin's dependencies are installed into a venv rather than via apt.
+    # Flask and gunicorn are packaged, but the PAM binding is not reliably
+    # available under a stable name across Debian releases, and PEP 668 blocks
+    # pip into the system interpreter. A self-contained venv sidesteps both.
+    # The door service itself keeps using system python3 with apt packages only.
+    info "Creating web admin virtualenv at $VENV_DIR ..."
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+    # 'six' is an undeclared dependency of python-pam 2.0.2 — its __internals
+    # imports it, but the wheel does not require it, so the module fails to
+    # import unless it is installed explicitly.
+    "$VENV_DIR/bin/pip" install --quiet Flask gunicorn python-pam six
+
+    # Fail loudly here rather than at the first login attempt.
+    if ! "$VENV_DIR/bin/python3" -c "import flask, pam" 2>/dev/null; then
+        error "Web admin dependencies failed to import — check the pip output above"
+        exit 1
+    fi
+
+    # Readable and executable by the doorweb service user, writable by nobody.
+    chown -R root:root "$VENV_DIR"
+    chmod -R go-w "$VENV_DIR"
 }
 
 # ── 2. Enable CCID escape commands (reader LED / buzzer feedback) ────────────────
@@ -95,6 +146,52 @@ create_user() {
     usermod -aG gpio    door
     usermod -aG plugdev door
     usermod -aG spi     door
+
+    # The admin group is the web UI's access control: authenticating as a valid
+    # Pi user is not enough, you must also be a member of this group.
+    if getent group "$ADMIN_GROUP" &>/dev/null; then
+        info "Group '$ADMIN_GROUP' already exists"
+    else
+        info "Creating admin group '$ADMIN_GROUP' ..."
+        groupadd --system "$ADMIN_GROUP"
+    fi
+
+    # 'door' must be a member so it can hand the control socket to the group.
+    usermod -aG "$ADMIN_GROUP" door
+
+    if id -u "$WEB_USER" &>/dev/null; then
+        info "User '$WEB_USER' already exists, skipping creation"
+    else
+        info "Creating system user '$WEB_USER' ..."
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$WEB_USER"
+    fi
+    # 'shadow' lets pam_unix verify passwords; the admin group lets it reach the
+    # control socket and the event database.
+    usermod -aG shadow       "$WEB_USER"
+    usermod -aG "$ADMIN_GROUP" "$WEB_USER"
+}
+
+grant_web_admins() {
+    local admins="${DOOR_WEB_ADMINS:-}"
+
+    if [[ -z "$admins" ]]; then
+        echo ""
+        echo "─── Web Admin Access ─────────────────────────────────────────"
+        echo "  Only members of the '$ADMIN_GROUP' group can sign in to the"
+        echo "  web UI, even with a valid Pi password."
+        echo ""
+        read -rp "  Pi usernames to grant access (space separated, blank to skip): " admins
+    fi
+
+    for u in $admins; do
+        if id -u "$u" &>/dev/null; then
+            usermod -aG "$ADMIN_GROUP" "$u"
+            info "Granted web admin access to '$u'"
+        else
+            warn "No such user '$u' — skipped"
+        fi
+    done
+    echo "──────────────────────────────────────────────────────────────"
 }
 
 # ── 4. polkit rule so the session-less 'door' user can reach pcscd ───────────────
@@ -124,8 +221,65 @@ EOF
 
 create_dirs() {
     info "Creating application directories ..."
-    install -d -m 755           "$APP_DIR"
-    install -d -m 750 -o door -g door "$CFG_DIR"
+    install -d -m 755 "$APP_DIR"
+    install -d -m 755 "$APP_DIR/templates"
+    install -d -m 755 "$APP_DIR/static"
+
+    # Config dir is group-traversable by the admin group so the web service can
+    # read web.json and manage its session secret. config.json itself stays
+    # door-only (it holds the MQTT password).
+    install -d -m 750 -o door -g "$ADMIN_GROUP" "$CFG_DIR"
+    install -d -m 750 -o door -g "$ADMIN_GROUP" "$TLS_DIR"
+
+    # setgid (2770) so the events database the door service creates inside
+    # inherits the admin group automatically and stays readable by the web UI.
+    install -d -m 2770 -o door -g "$ADMIN_GROUP" "$DATA_DIR"
+}
+
+# ── 5b. TLS certificate for the web admin ────────────────────────────────────────
+
+create_tls_cert() {
+    if [[ -f "$TLS_DIR/cert.pem" && -f "$TLS_DIR/key.pem" ]]; then
+        info "TLS certificate already present — keeping it"
+        return
+    fi
+
+    local ip host
+    host="$(hostname)"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -n "$ip" ]] || ip="127.0.0.1"
+
+    info "Generating a local CA and TLS certificate for $host / $ip ..."
+    # A separate CA plus a leaf signed by it, rather than one self-signed cert.
+    # Android will only install a certificate as trusted if it has CA:TRUE, and
+    # a self-signed leaf that also claims to be a CA is honoured inconsistently.
+    # With a real CA you install ca.pem on the phone once and every future leaf
+    # renewal is trusted automatically.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$TLS_DIR/ca-key.pem" -out "$TLS_DIR/ca.pem" \
+        -subj "/CN=Door Access Local CA" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+
+    # Chrome ignores the legacy CN entirely; without a matching SAN it rejects
+    # the certificate even after the CA is trusted — which would also mean no
+    # Web NFC, since that requires a secure context.
+    openssl req -newkey rsa:2048 -nodes \
+        -keyout "$TLS_DIR/key.pem" -out "$TLS_DIR/csr.pem" \
+        -subj "/CN=$host" 2>/dev/null
+
+    openssl x509 -req -in "$TLS_DIR/csr.pem" -days 3650 \
+        -CA "$TLS_DIR/ca.pem" -CAkey "$TLS_DIR/ca-key.pem" -CAcreateserial \
+        -out "$TLS_DIR/cert.pem" \
+        -extfile <(printf 'subjectAltName=DNS:%s,DNS:%s.local,DNS:localhost,IP:%s,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' \
+                   "$host" "$host" "$ip") 2>/dev/null
+
+    rm -f "$TLS_DIR/csr.pem"
+    chown root:"$ADMIN_GROUP" "$TLS_DIR"/*.pem
+    chmod 640 "$TLS_DIR/key.pem" "$TLS_DIR/ca-key.pem"
+    chmod 644 "$TLS_DIR/cert.pem" "$TLS_DIR/ca.pem"
+    info "Certificate written to $TLS_DIR/cert.pem (valid 10 years)"
+    info "Install $TLS_DIR/ca.pem on your phone to enable NFC scanning in Chrome"
 }
 
 # ── 6. Application files ─────────────────────────────────────────────────────────
@@ -137,20 +291,99 @@ install_app_files() {
     download "$APP_DIR/lock_controller.py"  "$REPO/lock_controller.py"
     download "$APP_DIR/door_sensor.py"      "$REPO/door_sensor.py"
     download "$APP_DIR/mqtt_handler.py"     "$REPO/mqtt_handler.py"
+    download "$APP_DIR/event_store.py"      "$REPO/event_store.py"
+    download "$APP_DIR/control_socket.py"   "$REPO/control_socket.py"
+    download "$APP_DIR/web_admin.py"        "$REPO/web_admin.py"
 
-    chown -R door:door "$APP_DIR"
-    chmod 644 "$APP_DIR"/*.py
+    info "Downloading web admin templates ..."
+    for t in base.html login.html dashboard.html tags.html history.html \
+             error.html _events_table.html; do
+        download "$APP_DIR/templates/$t" "$REPO/templates/$t"
+    done
+    for s in app.css nfc.js; do
+        download "$APP_DIR/static/$s" "$REPO/static/$s"
+    done
+
+    # World-readable so the doorweb service user can load the app it runs.
+    chown -R root:root "$APP_DIR"/*.py "$APP_DIR/templates" "$APP_DIR/static"
+    chmod 644 "$APP_DIR"/*.py "$APP_DIR/templates"/* "$APP_DIR/static"/*
 
     # Config: only download if not already present (never clobber user edits)
     if [[ ! -f "$CFG_DIR/config.json" ]]; then
         info "Installing default config ..."
         download "$CFG_DIR/config.json" "$REPO/config.json"
         configure_mqtt
+        # Stays door-only: it holds the MQTT password, which the web user has
+        # no reason to be able to read.
         chown door:door "$CFG_DIR/config.json"
         chmod 640 "$CFG_DIR/config.json"
     else
         warn "Existing config found at $CFG_DIR/config.json — skipping (not overwritten)"
+        migrate_config
+        # Older installs left this world-readable. It holds the MQTT password and
+        # there is now a second service account on the box, so tighten it.
+        chown door:door "$CFG_DIR/config.json"
+        chmod 640 "$CFG_DIR/config.json"
     fi
+
+    if [[ ! -f "$CFG_DIR/web.json" ]]; then
+        info "Installing web admin config ..."
+        download "$CFG_DIR/web.json" "$REPO/web.json"
+        chown root:"$ADMIN_GROUP" "$CFG_DIR/web.json"
+        chmod 640 "$CFG_DIR/web.json"
+    else
+        warn "Existing web config found at $CFG_DIR/web.json — skipping (not overwritten)"
+    fi
+
+    # Listen address lives here alone, so there is one source of truth for it.
+    if [[ ! -f "$CFG_DIR/web.env" ]]; then
+        echo "DOOR_WEB_BIND=0.0.0.0:$WEB_PORT" > "$CFG_DIR/web.env"
+        chown root:"$ADMIN_GROUP" "$CFG_DIR/web.env"
+        chmod 640 "$CFG_DIR/web.env"
+    fi
+
+    # Session-signing key. Created here with tight permissions so the service
+    # never has to generate it itself on a path it may not be able to write.
+    if [[ ! -f "$CFG_DIR/web_secret" ]]; then
+        info "Generating web session secret ..."
+        openssl rand -hex 32 > "$CFG_DIR/web_secret"
+        chown "$WEB_USER":"$WEB_USER" "$CFG_DIR/web_secret"
+        chmod 600 "$CFG_DIR/web_secret"
+    fi
+}
+
+migrate_config() {
+    # Add settings introduced after this config was written. The door service
+    # falls back to identical defaults, so this is purely so the file documents
+    # what is available. Never touches keys that are already present.
+    info "Checking config for missing sections ..."
+    python3 - "$CFG_DIR/config.json" <<'EOF'
+import json, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    cfg = json.load(f)
+
+added = []
+web = cfg.setdefault("web", {})
+for key, value in (
+    ("enabled", True),
+    ("control_socket", "/run/door_access/control.sock"),
+    ("event_db", "/var/lib/door_access/events.db"),
+    ("event_retention_days", 90),
+):
+    if key not in web:
+        web[key] = value
+        added.append(f"web.{key}")
+
+if added:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print("  added: " + ", ".join(added))
+else:
+    print("  nothing to add")
+EOF
 }
 
 configure_mqtt() {
@@ -205,39 +438,61 @@ create_log_file() {
 # ── 8. systemd service ───────────────────────────────────────────────────────────
 
 install_service() {
-    info "Installing systemd service ..."
-    download "$SERVICE_FILE" "$REPO/door_access.service"
-    chmod 644 "$SERVICE_FILE"
+    info "Installing systemd services ..."
+    download "$SERVICE_FILE"     "$REPO/door_access.service"
+    download "$WEB_SERVICE_FILE" "$REPO/door_admin.service"
+    chmod 644 "$SERVICE_FILE" "$WEB_SERVICE_FILE"
 
     systemctl daemon-reload
     systemctl enable door_access
-    info "Service enabled (not started — edit config first)"
+    systemctl enable door_admin
+    info "Services enabled (not started — edit config first)"
 }
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
 require_root
 install_packages
+create_venv
 enable_reader_escape
 create_user
 install_polkit_rule
 create_dirs
+create_tls_cert
 install_app_files
 create_log_file
 install_service
+grant_web_admins
+
+PI_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║           Door Access Control — Installation Complete        ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  1. Edit the config:                                         ║"
-echo "║     sudo nano /etc/door_access/config.json                   ║"
-echo "║                                                              ║"
-echo "║  2. Set your MQTT broker, credentials, and authorized UIDs   ║"
-echo "║                                                              ║"
-echo "║  3. Start the service:                                       ║"
-echo "║     sudo systemctl start door_access                         ║"
-echo "║                                                              ║"
-echo "║  4. Check logs:                                              ║"
-echo "║     journalctl -u door_access -f                             ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+echo "══════════════════════════════════════════════════════════════"
+echo "  Door Access Control — Installation Complete"
+echo "══════════════════════════════════════════════════════════════"
+echo ""
+echo "  1. Edit the config:"
+echo "       sudo nano /etc/door_access/config.json"
+echo "     Set your MQTT broker, credentials, and authorized UIDs."
+echo ""
+echo "  2. Start both services:"
+echo "       sudo systemctl start door_access door_admin"
+echo ""
+echo "  3. Open the web admin:"
+echo "       https://${PI_IP:-<pi-ip>}:$WEB_PORT"
+echo "     Sign in with a Pi account that is in the '$ADMIN_GROUP' group."
+echo "     Add more admins later with:"
+echo "       sudo usermod -aG $ADMIN_GROUP <username>"
+echo "     (the user must log out and back in for it to take effect)"
+echo ""
+echo "  4. To scan tags with your phone, install the CA certificate:"
+echo "       $TLS_DIR/ca.pem"
+echo "     Android: Settings → Security → Encryption & credentials →"
+echo "              Install a certificate → CA certificate"
+echo "     Web NFC needs Chrome on Android; iOS Safari cannot do it."
+echo ""
+echo "  5. Check logs:"
+echo "       journalctl -u door_access -f"
+echo "       journalctl -u door_admin -f"
+echo ""
+echo "══════════════════════════════════════════════════════════════"

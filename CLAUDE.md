@@ -6,18 +6,45 @@ Python application for Raspberry Pi controlling a 12V electromagnetic door lock.
 
 ## Architecture
 
+Two systemd services. `door_access` owns all hardware and config; `door_admin` is a Flask web UI running as a different user with neither.
+
 Event-driven with a shared `queue.Queue(maxsize=100)`. All hardware threads and GPIO ISR callbacks are producers; the main thread is the sole consumer. This keeps GPIO writes and business logic single-threaded.
 
 ```
-nfc_reader.py  ──► queue ──► main.py dispatch loop ──► lock_controller.py
-door_sensor.py ──►              │                   ──► mqtt_handler.py
-mqtt_handler.py ──►             └─ logging
+nfc_reader.py   ──► queue ──► main.py dispatch loop ──► lock_controller.py
+door_sensor.py  ──►             │                    ──► mqtt_handler.py
+mqtt_handler.py ──►             ├─ logging           ──► event_store.py (SQLite)
 lock_controller.py (button ISR) ──►
+control_socket.py ──────────────┘   ▲
+                                    │ Unix socket (request/response)
+       door_admin.service ──► web_admin.py ──► event_store.EventReader (read-only)
 ```
 
-Event types: `NFC_UID`, `BUTTON_PRESS`, `MQTT_COMMAND`, `DOOR_STATE`, `DOOR_ALERT`, `SET_UNLOCK_DURATION`, `UNLOCK_TIMER_EXPIRED`, `SET_ENROLL_MODE`, `SET_ENROLL_NAME`, `SET_SELECTED_TAG`, `REMOVE_SELECTED_TAG`
+Event types: `NFC_UID`, `BUTTON_PRESS`, `DOOR_STATE`, `DOOR_ALERT`, `UNLOCK_TIMER_EXPIRED`, `WEB_COMMAND`
 
-HA-driven tag enrollment/removal: `SET_ENROLL_MODE` arms a **one-shot** capture (shared `runtime["enroll_event"]` also passed to `NFCReader` so an armed scan flashes green instead of blue). The next `NFC_UID` while armed writes `UID → name` into `config["authorized_uids"]`, persists via `save_config`, and disarms — it does **not** unlock. Removal deletes by selected name. Runtime enroll state (`enroll_name`, `selected_tag`, `enroll_event`) lives in a `runtime` dict in `main()`, never persisted.
+**Where writable features are allowed to live.** Anything that changes the door's behaviour belongs in `web_admin.py`, never in `mqtt_handler.py`. The web UI authenticates each operator individually (PAM + `dooradmin` group membership) and audits them; Home Assistant cannot do either. See the two sections below.
+
+**Home Assistant is monitoring-only — this is a security requirement, not an oversight.** HA has no per-user access control, so anything actuatable from HA is actuatable by every HA user. There is deliberately **no remote unlock** (the lock appears as a read-only `binary_sensor`, not a `lock` entity, because an HA `lock` requires a command topic), **no HA-driven tag enrollment or removal**, and **no HA-settable unlock duration**. The handler subscribes to nothing. Every writable feature lives in the web admin behind per-user auth. Do not reintroduce an HA-facing control of any kind.
+
+`MQTTHandler.RETIRED_TOPICS` / `RETIRED_DISCOVERY` clear the retained topics from those removed features on every connect, so old entities vanish from HA on upgrade rather than lingering as clickable controls. **When you remove an HA entity, add its discovery suffix and topics to these tuples** — deleting the publish alone leaves the retained config in the broker and the entity stays in HA, still clickable.
+
+## Web Admin (`door_admin.service`)
+
+Flask + gunicorn (TLS), runs as `doorweb`, separate from the door service. Dependencies live in `/opt/door_access/venv` (Flask, gunicorn, python-pam) — **not** apt, because the PAM binding isn't reliably packaged and PEP 668 blocks system pip. The door service itself still uses system python3 + apt only; don't add venv deps to it.
+
+- **Auth** — PAM (`login` service) *plus* `dooradmin` group membership. Both required. Bad password and not-in-group return the identical message so the UI never confirms which accounts exist. `doorweb` is in `shadow` so pam_unix can read `/etc/shadow` directly (the setuid `unix_chkpwd` helper only lets a non-root caller check its *own* password).
+- **No shared state with the door service except the socket and the DB.** The web app cannot write `config.json` (it can't even read it — the MQTT password lives there) and has no GPIO. Every mutation is a `ControlClient.call()` over `/run/door_access/control.sock`, dispatched as `WEB_COMMAND` and executed in `_run_web_command` on the event loop.
+- **Socket authorization is filesystem permissions** — mode 0660, group `dooradmin`. There is no auth inside the protocol. `ControlSocket._grant_group_access` re-groups the socket and its systemd-created runtime dir at startup, which is why `door` must also be in `dooradmin`.
+- **`normalize_uid` lives in `control_socket.py`** because both processes must agree exactly. Web NFC gives `aa:bb:11:22`, the reader gives `AABB1122`; normalizing in only one process silently stores tags that no live scan matches.
+- **Single gunicorn worker with threads** — the login throttle is per-process in-memory state; multiple workers would weaken it.
+- **CSP is `'self'` with no inline scripts or styles**, so no `onclick` attributes — destructive buttons use `data-confirm`, wired up in `static/nfc.js`.
+- **Web NFC is progressive enhancement only.** Chrome/Android + trusted HTTPS; absent everywhere else including all of iOS. The "recent unknown scans" flow (denied UIDs from the event log) is the path that always works and must keep working.
+
+## Event history (`event_store.py`)
+
+SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main thread only, best-effort — a history failure must never stop the door). `EventReader` reads from the web process.
+
+`EventReader` opens `mode=rw` + `PRAGMA query_only=ON` rather than `mode=ro`: a WAL reader must write the `-shm` sidecar to coordinate with the live writer, so a truly read-only handle fails exactly when the door service is busy logging. The directory is setgid `dooradmin` (2770) so the DB the door service creates inherits a group the web user can reach.
 
 `DOOR_STATE`/`DOOR_ALERT` carry a `door` key (door name) — there is one `DoorSensor` instance per configured door.
 
@@ -29,10 +56,16 @@ HA-driven tag enrollment/removal: `SET_ENROLL_MODE` arms a **one-shot** capture 
 | `nfc_reader.py` | `NFCReader` class — pyscard PC/SC, GET_UID APDU `[0xFF,0xCA,0x00,0x00,0x00]`, daemon thread; ACR1552 LED/buzzer feedback via CCID escape (beep + green=granted / blue-blink=denied) |
 | `lock_controller.py` | `LockController` class — GPIO17 relay, GPIO18 LED, GPIO27 button ISR, `threading.Timer` auto-relock |
 | `door_sensor.py` | `DoorSensor` class — one instance per door (name + pin + active_low), edge detection, per-door open-too-long alert monitor thread; events tagged with `door` |
-| `mqtt_handler.py` | `MQTTHandler` class — paho-mqtt, LWT, retain flags, auto-reconnect via `loop_start()`; HA MQTT discovery (`_publish_discovery`) + tag scanner (`publish_tag`) |
-| `config.json` | All runtime settings (deployed to `/etc/door_access/config.json` on Pi) |
+| `mqtt_handler.py` | `MQTTHandler` class — paho-mqtt, LWT, retain flags, auto-reconnect via `loop_start()`; HA MQTT discovery (`_publish_discovery`) + tag scanner (`publish_tag`); monitoring-only (see above) |
+| `event_store.py` | `EventStore` (writer, door service) / `EventReader` (reader, web) — SQLite event history |
+| `control_socket.py` | `ControlSocket` (server, door service) / `ControlClient` (web); `normalize_uid` shared by both |
+| `web_admin.py` | Flask web admin — PAM login, `dooradmin` gating, CSRF, login throttle, tags + history + unlock |
+| `templates/`, `static/` | Web admin pages; `static/nfc.js` holds the optional Web NFC scan |
+| `config.json` | Door service settings (deployed to `/etc/door_access/config.json` on Pi) |
+| `web.json` | Web admin settings (deployed to `/etc/door_access/web.json`) — separate file so `doorweb` never needs to read the MQTT password |
 | `door_access.service` | systemd unit — runs as `door` user, auto-restart on failure |
-| `install.sh` | apt deps (incl. rpi-lgpio), CCID escape, door user, polkit rule, dirs, downloads files, enables service |
+| `door_admin.service` | systemd unit — runs as `doorweb`, gunicorn + TLS, hardened, `SupplementaryGroups=shadow dooradmin` |
+| `install.sh` | apt deps (incl. rpi-lgpio), venv, CCID escape, users/groups, polkit rule, local CA + TLS cert, dirs, installs files, enables both services. `DOOR_SRC_DIR=<path>` installs from a local checkout instead of GitHub |
 | `README.md` | Wiring, setup, MQTT topic reference, HA config examples |
 
 ## Hardware
@@ -48,11 +81,14 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 
 ## Runtime Paths on Pi
 
-- App files: `/opt/door_access/`
-- Config: `/etc/door_access/config.json`
+- App files: `/opt/door_access/` (incl. `templates/`, `static/`, `venv/`)
+- Config: `/etc/door_access/config.json` (door-only), `web.json` + `web.env` + `web_secret` + `tls/` (web)
+- Event DB: `/var/lib/door_access/events.db` (setgid `dooradmin` dir)
+- Control socket: `/run/door_access/control.sock` (0660, group `dooradmin`)
 - Log: `/var/log/door_access/door_access.log` (door-owned dir so rotation works; daily rotation, 7 days)
-- Service: `/etc/systemd/system/door_access.service`
-- Service user: `door` (groups: gpio, plugdev, spi)
+- Services: `/etc/systemd/system/door_access.service`, `door_admin.service`
+- Service users: `door` (groups: gpio, plugdev, spi, dooradmin), `doorweb` (groups: shadow, dooradmin)
+- Admin group: `dooradmin` — the web UI's access control; `usermod -aG dooradmin <user>` to grant
 
 ## MQTT Topics
 
@@ -60,21 +96,13 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 |-------|-----------|--------|---------|
 | `home/door/availability` | pub | Yes | `online`/`offline` (retained + LWT, so HA sees current state after a restart) |
 | `home/door/lock/state` | pub | Yes | `LOCKED`/`UNLOCKED` |
-| `home/door/lock/set` | sub | — | `LOCK`/`UNLOCK` |
 | `home/door/sensor/<name>/state` | pub | Yes | `OPEN`/`CLOSED` (one per door) |
-| `home/door/unlock_duration/state` | pub | Yes | current unlock seconds |
-| `home/door/unlock_duration/set` | sub | — | seconds 1–60 (HA `number` entity) |
-| `home/door/enroll/state` | pub | Yes | `ON`/`OFF` (enroll armed) |
-| `home/door/enroll/set` | sub | — | `ON`/`OFF` (HA `switch`, one-shot) |
-| `home/door/enroll_name/state` | pub | Yes | name for next enrolled tag |
-| `home/door/enroll_name/set` | sub | — | name string (HA `text`) |
-| `home/door/known_tags/state` | pub | Yes | selected known-tag name |
-| `home/door/known_tags/set` | sub | — | name to select (HA `select`, options track `authorized_uids`) |
-| `home/door/remove_tag/set` | sub | — | `PRESS` removes selected tag (HA `button`) |
 | `home/door/alert` | pub | No | string |
 | `home/door/last_access` | pub | Yes | JSON |
 | `home/door/nfc/tag` | pub | No | raw UID of every scan (HA MQTT tag scanner) |
-| `homeassistant/<comp>/door_access/.../config` | pub | Yes | HA MQTT discovery configs (lock, number, binary_sensor×N, sensor×2, tag, switch, text, select, button) when `mqtt.discovery` true |
+| `homeassistant/<comp>/door_access/.../config` | pub | Yes | HA MQTT discovery configs (binary_sensor×(N+1), sensor×2, tag) when `mqtt.discovery` true |
+
+**There are no `sub` rows.** `MQTTHandler` calls `subscribe()` nowhere and sets no `on_message`; the connection is publish-only. Adding a subscription re-opens the RBAC hole this design exists to close.
 
 ## Key Design Decisions
 

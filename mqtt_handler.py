@@ -1,43 +1,54 @@
 import datetime
 import json
 import logging
-import queue
 import threading
 
 logger = logging.getLogger(__name__)
 
 
 class MQTTHandler:
+    """Home Assistant integration — publish only.
+
+    Nothing here is writable from Home Assistant. HA has no per-user access
+    control, so any entity it exposes is available to every HA user; door state,
+    lock state, alerts and access history are published for observation, and the
+    handler subscribes to no topics at all. Settings that affect the door live
+    behind the web admin's per-user authentication instead.
+    """
+
     TOPIC_AVAILABILITY = "home/door/availability"
     TOPIC_LOCK_STATE   = "home/door/lock/state"
-    TOPIC_LOCK_SET     = "home/door/lock/set"
     TOPIC_DOOR_STATE   = "home/door/sensor/state"
     TOPIC_ALERT        = "home/door/alert"
     TOPIC_LAST_ACCESS  = "home/door/last_access"
     TOPIC_TAG          = "home/door/nfc/tag"
-    TOPIC_UNLOCK_SET   = "home/door/unlock_duration/set"
-    TOPIC_UNLOCK_STATE = "home/door/unlock_duration/state"
-    TOPIC_ENROLL_SET        = "home/door/enroll/set"
-    TOPIC_ENROLL_STATE      = "home/door/enroll/state"
-    TOPIC_ENROLL_NAME_SET   = "home/door/enroll_name/set"
-    TOPIC_ENROLL_NAME_STATE = "home/door/enroll_name/state"
-    TOPIC_KNOWN_SELECT      = "home/door/known_tags/set"
-    TOPIC_KNOWN_STATE       = "home/door/known_tags/state"
-    TOPIC_REMOVE_PRESS      = "home/door/remove_tag/set"
 
-    NO_TAGS = "(none)"
+    # Retained topics from removed features (remote lock/unlock, HA-driven tag
+    # enrollment and removal, the unlock-duration number). Cleared on connect so
+    # the entities and their retained state disappear from HA and the broker
+    # instead of lingering.
+    RETIRED_TOPICS = (
+        "home/door/lock/set",
+        "home/door/enroll/set", "home/door/enroll/state",
+        "home/door/enroll_name/set", "home/door/enroll_name/state",
+        "home/door/known_tags/set", "home/door/known_tags/state",
+        "home/door/remove_tag/set",
+        "home/door/unlock_duration/set", "home/door/unlock_duration/state",
+    )
+    RETIRED_DISCOVERY = (
+        "lock/door_access/lock",
+        "switch/door_access/enroll",
+        "text/door_access/enroll_name",
+        "select/door_access/known_tags",
+        "button/door_access/remove_tag",
+        "number/door_access/unlock_duration",
+    )
 
-    def __init__(self, event_queue: queue.Queue, config: dict, shutdown_event: threading.Event):
-        self._queue = event_queue
+    def __init__(self, config: dict, shutdown_event: threading.Event):
         self._cfg = config["mqtt"]
         self._shutdown = shutdown_event
         self._enabled: bool = self._cfg.get("enabled", True)
         self._door_names = [d["name"] for d in config.get("doors", [])] or ["door"]
-        self._unlock_duration: float = config["lock"]["unlock_duration_seconds"]
-        # Shared reference (same dict object main mutates) so the Known Tags
-        # select always reflects the current authorized set.
-        self._authorized: dict = config.get("authorized_uids", {})
-        self._selected: str = self.NO_TAGS
         self._client = None
         self._connected = False
         self._connected_lock = threading.Lock()
@@ -66,7 +77,7 @@ class MQTTHandler:
         self._client.reconnect_delay_set(min_delay=1, max_delay=120)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
-        self._client.on_message = self._on_message
+        # No on_message handler: this client subscribes to nothing.
         logger.info("MQTT client configured for %s:%d", self._cfg["broker"], self._cfg.get("port", 1883))
 
     def connect(self) -> None:
@@ -116,67 +127,25 @@ class MQTTHandler:
         scan fires HA's native tag_scanned trigger. Not retained (it's an event)."""
         self._safe_publish(self.TOPIC_TAG, uid, retain=False)
 
-    def publish_unlock_duration(self, seconds: float) -> None:
-        self._unlock_duration = seconds
-        self._safe_publish(self.TOPIC_UNLOCK_STATE, self._fmt_duration(seconds), retain=True)
-
-    def publish_enroll_state(self, on: bool) -> None:
-        self._safe_publish(self.TOPIC_ENROLL_STATE, "ON" if on else "OFF", retain=True)
-
-    def publish_enroll_name(self, name: str) -> None:
-        self._safe_publish(self.TOPIC_ENROLL_NAME_STATE, name, retain=True)
-
-    def publish_selected_tag(self, name: str) -> None:
-        opts = self._known_options()
-        self._selected = name if name in opts else opts[0]
-        self._safe_publish(self.TOPIC_KNOWN_STATE, self._selected, retain=True)
-
-    def _known_options(self) -> list:
-        names = sorted(set(self._authorized.values()))
-        return names or [self.NO_TAGS]
-
-    def publish_known_tags(self) -> None:
-        """Refresh the Known Tags select: re-publish its discovery config with the
-        current option list, then publish a still-valid selected state. Call after
-        any change to authorized_uids (enroll/remove)."""
-        opts = self._known_options()
-        if self._selected not in opts:
-            self._selected = opts[0]
-        if self._cfg.get("discovery", True):
-            prefix = self._cfg.get("discovery_prefix", "homeassistant")
-            self._safe_publish(
-                f"{prefix}/select/door_access/known_tags/config",
-                json.dumps(self._known_tags_discovery()), retain=True,
-            )
-        self._safe_publish(self.TOPIC_KNOWN_STATE, self._selected, retain=True)
-
-    @staticmethod
-    def _fmt_duration(seconds: float) -> str:
-        # Send an int when it's whole (HA number entity displays cleanly)
-        return str(int(seconds)) if float(seconds).is_integer() else str(seconds)
-
     def _publish_discovery(self) -> None:
-        """Publish Home Assistant MQTT discovery configs (retained) so the lock,
-        door sensor, last-access sensor, alert sensor, and NFC tag scanner appear
-        automatically without manual YAML."""
+        """Publish Home Assistant MQTT discovery configs (retained) so the lock
+        status, door sensors, last-access sensor, alert sensor, and NFC tag
+        scanner appear automatically without manual YAML.
+
+        The lock is exposed as a read-only binary_sensor, not a `lock` entity:
+        an HA lock entity requires a command topic, which would give every HA
+        user the ability to unlock the door."""
         if not self._cfg.get("discovery", True):
             return
         prefix = self._cfg.get("discovery_prefix", "homeassistant")
         device = self._device_block()
         avail = self._avail_block()
         configs = {
-            f"{prefix}/lock/door_access/lock/config": {
-                "name": "Lock", "unique_id": "door_access_lock",
-                "state_topic": self.TOPIC_LOCK_STATE, "command_topic": self.TOPIC_LOCK_SET,
-                "payload_lock": "LOCK", "payload_unlock": "UNLOCK",
-                "state_locked": "LOCKED", "state_unlocked": "UNLOCKED",
-                **avail, "device": device,
-            },
-            f"{prefix}/number/door_access/unlock_duration/config": {
-                "name": "Unlock Duration", "unique_id": "door_access_unlock_duration",
-                "command_topic": self.TOPIC_UNLOCK_SET, "state_topic": self.TOPIC_UNLOCK_STATE,
-                "min": 1, "max": 60, "step": 1, "unit_of_measurement": "s",
-                "mode": "box", "icon": "mdi:timer-lock-open", "retain": True,
+            f"{prefix}/binary_sensor/door_access/lock/config": {
+                "name": "Lock", "unique_id": "door_access_lock_state",
+                "state_topic": self.TOPIC_LOCK_STATE,
+                "payload_on": "UNLOCKED", "payload_off": "LOCKED",
+                "device_class": "lock",
                 **avail, "device": device,
             },
             f"{prefix}/sensor/door_access/last_access/config": {
@@ -196,25 +165,6 @@ class MQTTHandler:
                 "topic": self.TOPIC_TAG, "value_template": "{{ value }}",
                 "device": device,
             },
-            f"{prefix}/switch/door_access/enroll/config": {
-                "name": "Enroll Next Tag", "unique_id": "door_access_enroll",
-                "command_topic": self.TOPIC_ENROLL_SET, "state_topic": self.TOPIC_ENROLL_STATE,
-                "payload_on": "ON", "payload_off": "OFF", "icon": "mdi:card-plus",
-                **avail, "device": device,
-            },
-            f"{prefix}/text/door_access/enroll_name/config": {
-                "name": "New Tag Name", "unique_id": "door_access_enroll_name",
-                "command_topic": self.TOPIC_ENROLL_NAME_SET, "state_topic": self.TOPIC_ENROLL_NAME_STATE,
-                "max": 32, "icon": "mdi:rename-box",
-                **avail, "device": device,
-            },
-            f"{prefix}/select/door_access/known_tags/config": self._known_tags_discovery(),
-            f"{prefix}/button/door_access/remove_tag/config": {
-                "name": "Remove Selected Tag", "unique_id": "door_access_remove_tag",
-                "command_topic": self.TOPIC_REMOVE_PRESS, "payload_press": "PRESS",
-                "icon": "mdi:card-remove",
-                **avail, "device": device,
-            },
         }
         # One binary_sensor per door.
         for name in self._door_names:
@@ -230,7 +180,19 @@ class MQTTHandler:
         # Clear stale retained topics from the earlier single-door scheme.
         self._safe_publish(f"{prefix}/binary_sensor/door_access/door/config", "", retain=True)
         self._safe_publish(self.TOPIC_DOOR_STATE, "", retain=True)
+        self._clear_retired(prefix)
         logger.info("Published HA MQTT discovery configs (%d entities)", len(configs))
+
+    def _clear_retired(self, prefix: str) -> None:
+        """Delete retained discovery configs and state for features removed from
+        Home Assistant (remote unlock, tag enrollment/removal, unlock duration).
+        An empty retained payload on a discovery topic tells HA to drop the
+        entity; without this the old controls stay in HA and remain clickable
+        after an upgrade."""
+        for suffix in self.RETIRED_DISCOVERY:
+            self._safe_publish(f"{prefix}/{suffix}/config", "", retain=True)
+        for topic in self.RETIRED_TOPICS:
+            self._safe_publish(topic, "", retain=True)
 
     def _device_block(self) -> dict:
         return {
@@ -247,32 +209,14 @@ class MQTTHandler:
             "payload_not_available": "offline",
         }
 
-    def _known_tags_discovery(self) -> dict:
-        return {
-            "name": "Known Tags", "unique_id": "door_access_known_tags",
-            "command_topic": self.TOPIC_KNOWN_SELECT, "state_topic": self.TOPIC_KNOWN_STATE,
-            "options": self._known_options(), "icon": "mdi:card-account-details",
-            **self._avail_block(), "device": self._device_block(),
-        }
-
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             with self._connected_lock:
                 self._connected = True
             logger.info("MQTT connected to %s", self._cfg["broker"])
             client.publish(self.TOPIC_AVAILABILITY, "online", qos=1, retain=True)
-            client.subscribe(self.TOPIC_LOCK_SET, qos=1)
-            client.subscribe(self.TOPIC_UNLOCK_SET, qos=1)
-            client.subscribe(self.TOPIC_ENROLL_SET, qos=1)
-            client.subscribe(self.TOPIC_ENROLL_NAME_SET, qos=1)
-            client.subscribe(self.TOPIC_KNOWN_SELECT, qos=1)
-            client.subscribe(self.TOPIC_REMOVE_PRESS, qos=1)
+            # No subscribe() call: Home Assistant cannot change anything here.
             self._publish_discovery()
-            # Publish current unlock duration so the HA number entity shows it.
-            self.publish_unlock_duration(self._unlock_duration)
-            # Seed enroll/known-tag entity states (enroll always starts disarmed).
-            self.publish_enroll_state(False)
-            self.publish_known_tags()
         else:
             logger.error("MQTT connect refused (rc=%d)", rc)
 
@@ -283,39 +227,6 @@ class MQTTHandler:
             logger.warning("MQTT unexpected disconnect (rc=%d), will reconnect", rc)
         else:
             logger.info("MQTT disconnected cleanly")
-
-    def _on_message(self, client, userdata, message) -> None:
-        try:
-            raw = message.payload.decode("utf-8").strip()
-            if message.topic == self.TOPIC_UNLOCK_SET:
-                try:
-                    seconds = float(raw)
-                except ValueError:
-                    logger.warning("Ignoring non-numeric unlock duration: %r", raw)
-                    return
-                self._queue.put_nowait({"type": "SET_UNLOCK_DURATION", "seconds": seconds})
-                return
-            if message.topic == self.TOPIC_ENROLL_SET:
-                self._queue.put_nowait({"type": "SET_ENROLL_MODE", "active": raw.upper() == "ON"})
-                return
-            if message.topic == self.TOPIC_ENROLL_NAME_SET:
-                self._queue.put_nowait({"type": "SET_ENROLL_NAME", "name": raw})
-                return
-            if message.topic == self.TOPIC_KNOWN_SELECT:
-                self._queue.put_nowait({"type": "SET_SELECTED_TAG", "name": raw})
-                return
-            if message.topic == self.TOPIC_REMOVE_PRESS:
-                self._queue.put_nowait({"type": "REMOVE_SELECTED_TAG"})
-                return
-            payload = raw.upper()
-            if payload in ("LOCK", "UNLOCK"):
-                self._queue.put_nowait({"type": "MQTT_COMMAND", "payload": payload})
-            else:
-                logger.warning("Ignoring unknown MQTT command: %r", payload)
-        except queue.Full:
-            logger.warning("Event queue full, dropping MQTT message")
-        except Exception as e:
-            logger.error("Error processing MQTT message: %s", e)
 
     def _safe_publish(self, topic: str, payload: str, retain: bool = False, qos: int = 1) -> None:
         if not self._enabled:

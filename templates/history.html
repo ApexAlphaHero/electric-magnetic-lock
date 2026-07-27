@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}History — Door Access{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Event history</h2>
+
+  <form method="get" action="{{ url_for('history_page') }}" class="filters">
+    <label for="type" class="sr">Event type</label>
+    <select id="type" name="type">
+      <option value="">All events</option>
+      {% for t in all_types %}
+        <option value="{{ t }}" {{ 'selected' if t == etype }}>{{ t|replace('_', ' ')|title }}</option>
+      {% endfor %}
+    </select>
+
+    <label for="q" class="sr">Search</label>
+    <input id="q" name="q" value="{{ query }}" placeholder="Name, UID or user" maxlength="64">
+
+    <button type="submit">Filter</button>
+    {% if etype or query %}
+      <a class="button" href="{{ url_for('history_page') }}">Clear</a>
+    {% endif %}
+  </form>
+
+  {% if not history_ok %}
+    <p class="muted">Event history is unavailable — check that the door service is running.</p>
+  {% elif not events %}
+    <p class="muted">No events match.</p>
+  {% else %}
+    <p class="muted small">{{ total }} event{{ '' if total == 1 else 's' }}, page {{ page }} of {{ pages }}.</p>
+    {% include "_events_table.html" %}
+
+    {% if pages > 1 %}
+      <nav class="pager">
+        {% if page > 1 %}
+          <a class="button" href="{{ url_for('history_page', page=page - 1, type=etype, q=query) }}">← Newer</a>
+        {% endif %}
+        {% if page < pages %}
+          <a class="button" href="{{ url_for('history_page', page=page + 1, type=etype, q=query) }}">Older →</a>
+        {% endif %}
+      </nav>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

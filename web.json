@@ -1,0 +1,13 @@
+{
+  "_comment": "Settings for the web admin service only (deployed to /etc/door_access/web.json). Kept separate from config.json so the web user never needs read access to the door service's config, which holds the MQTT password. The listen address lives in web.env.",
+
+  "admin_group": "dooradmin",
+  "session_minutes": 60,
+  "allow_unlock": true,
+  "max_login_attempts": 5,
+  "lockout_minutes": 15,
+  "page_size": 50,
+
+  "control_socket": "/run/door_access/control.sock",
+  "event_db": "/var/lib/door_access/events.db"
+}

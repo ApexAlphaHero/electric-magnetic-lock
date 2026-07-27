@@ -1,0 +1,213 @@
+/* Door Access admin — small, dependency-free stylesheet.
+   Phone-first: this gets used standing at the door. */
+
+:root {
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --ink: #1b1d21;
+  --muted: #6b7280;
+  --line: #e2e5ea;
+  --accent: #2563eb;
+  --accent-ink: #ffffff;
+  --danger: #b91c1c;
+  --ok: #15803d;
+  --warn-bg: #fef3c7;
+  --open: #b45309;
+  --shut: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --card: #1c1f25;
+    --ink: #e8eaed;
+    --muted: #9aa1ac;
+    --line: #2c3138;
+    --accent: #3b82f6;
+    --danger: #f87171;
+    --ok: #4ade80;
+    --warn-bg: #3b2f14;
+    --open: #fbbf24;
+    --shut: #4ade80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+/* ── nav ─────────────────────────────────────────────────────────────────── */
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+}
+
+.nav .brand { font-weight: 700; }
+.nav a { color: var(--muted); text-decoration: none; padding: 0.25rem 0; }
+.nav a:hover { color: var(--ink); }
+.nav a.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
+.nav-right { margin-left: auto; display: flex; align-items: center; gap: 0.75rem; }
+.nav .who { color: var(--muted); font-size: 0.875rem; }
+
+/* ── cards ───────────────────────────────────────────────────────────────── */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.card.warn { background: var(--warn-bg); }
+.card h1 { margin: 0 0 0.5rem; font-size: 1.375rem; }
+.card h2 { margin: 0 0 0.75rem; font-size: 1.0625rem; }
+.login { max-width: 24rem; margin: 3rem auto; }
+
+/* ── status ──────────────────────────────────────────────────────────────── */
+
+.statusrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2rem;
+  margin-bottom: 1.25rem;
+}
+
+.stat { display: flex; flex-direction: column; }
+.stat .label { color: var(--muted); font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.stat .value { font-size: 1.5rem; font-weight: 600; }
+.stat .value.open { color: var(--open); }
+.stat .value.shut { color: var(--shut); }
+
+.actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+
+/* ── forms ───────────────────────────────────────────────────────────────── */
+
+label { display: block; font-size: 0.875rem; color: var(--muted); margin-bottom: 0.25rem; }
+
+input[type=text], input[type=password], input[type=number], input:not([type]), select {
+  width: 100%;
+  padding: 0.5rem 0.625rem;
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+}
+
+input:focus, select:focus, button:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.addform { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+.addform .field { flex: 1 1 14rem; }
+.addform .field:last-child { flex: 0 0 auto; padding-top: 1.4rem; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.filters select { flex: 0 1 14rem; }
+.filters input { flex: 1 1 12rem; }
+
+.inline { display: flex; gap: 0.375rem; align-items: center; }
+.inline input { min-width: 6rem; }
+
+/* Editable stat: the number should read like the other .stat values next to it. */
+.stat .duration { margin-top: 0.125rem; }
+.stat .duration input { min-width: 0; width: 4.25rem; font-size: 1.25rem; font-weight: 600; }
+.stat .duration .unit { color: var(--muted); margin-right: 0.25rem; }
+
+button, .button {
+  display: inline-block;
+  padding: 0.5rem 0.875rem;
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+button:hover, .button:hover { border-color: var(--muted); }
+button[disabled] { opacity: 0.5; cursor: default; }
+
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+button.big { padding: 0.75rem 1.5rem; font-size: 1.0625rem; font-weight: 600; }
+button.danger { color: var(--danger); }
+button.link { background: none; border: none; color: var(--accent); padding: 0.25rem; }
+
+/* ── tables ──────────────────────────────────────────────────────────────── */
+
+.scroll { overflow-x: auto; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.9375rem; }
+th, td { text-align: left; padding: 0.5rem 0.75rem 0.5rem 0; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-size: 0.8125rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+tr.denied td { background: rgba(185, 28, 28, 0.06); }
+
+.tag {
+  display: inline-block;
+  padding: 0.0625rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.tag.t-access_granted, .tag.t-tag_added { color: var(--ok); }
+.tag.t-access_denied, .tag.t-web_login_failed, .tag.t-web_login_denied,
+.tag.t-tag_removed, .tag.t-door_open_too_long { color: var(--danger); }
+.tag.t-web_unlock, .tag.t-button_unlock { color: var(--open); }
+
+.pager { display: flex; gap: 0.5rem; margin-top: 1rem; }
+
+/* ── misc ────────────────────────────────────────────────────────────────── */
+
+.muted { color: var(--muted); }
+.small { font-size: 0.8125rem; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.nowrap { white-space: nowrap; }
+.hidden { display: none; }
+code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+
+.sr {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.nfc { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem; }
+
+.flashes { list-style: none; padding: 0; margin: 0 0 1rem; }
+
+.flash {
+  padding: 0.625rem 0.875rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--line);
+  background: var(--card);
+  margin-bottom: 0.5rem;
+}
+
+.flash.error { border-left: 4px solid var(--danger); }
+.flash.success { border-left: 4px solid var(--ok); }

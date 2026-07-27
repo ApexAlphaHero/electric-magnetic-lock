@@ -73,27 +73,39 @@ system interpreter.
 sudo apt-get update
 sudo apt-get install -y \
   pcscd pcsc-tools libpcsclite-dev \
-  python3-pyscard python3-paho-mqtt python3-rpi-lgpio
+  python3-pyscard python3-paho-mqtt python3-rpi-lgpio \
+  python3-venv libpam0g-dev openssl
 ```
 
 > **`python3-rpi-lgpio`** is the lgpio-backed drop-in for `RPi.GPIO`. The classic
 > `python3-rpi.gpio` does **not** work on the 6.x kernels in current Pi OS — don't install both.
 
+The door service itself uses only these apt packages. The [Web Admin](#web-admin) needs
+Flask, gunicorn and python-pam, which the installer puts in a venv at
+`/opt/door_access/venv` — `python-pam` isn't reliably packaged across Debian releases, and
+PEP 668 blocks pip into the system interpreter.
+
 ### One-liner install from GitHub
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-lock/master/install.sh | sudo bash
 ```
 
 The installer will:
 1. Install all system + Python packages (from apt) and enable the `pcscd` PC/SC daemon
-2. Enable CCID escape commands in `/etc/libccid_Info.plist` (needed for the reader's LED/buzzer)
-3. Create a dedicated `door` system user with hardware group access
-4. Install a polkit rule so the session-less `door` user can reach `pcscd`
-5. Download all application files to `/opt/door_access/`
-6. Install the default config to `/etc/door_access/config.json`
-7. Create the log directory `/var/log/door_access/` (door-owned, so rotation works)
-8. Install and enable the `door_access` systemd service
+2. Create `/opt/door_access/venv` with the web admin's dependencies (Flask, gunicorn, python-pam)
+3. Enable CCID escape commands in `/etc/libccid_Info.plist` (needed for the reader's LED/buzzer)
+4. Create the `door` and `doorweb` system users and the `dooradmin` admin group
+5. Install a polkit rule so the session-less `door` user can reach `pcscd`
+6. Generate a local CA and TLS certificate in `/etc/door_access/tls/`
+7. Download all application files to `/opt/door_access/`
+8. Install the default configs to `/etc/door_access/`
+9. Create the log directory `/var/log/door_access/` and the event database directory `/var/lib/door_access/`
+10. Install and enable the `door_access` and `door_admin` systemd services
+11. Prompt for the Pi usernames that should get web admin access
+
+> Set `DOOR_SRC_DIR=<path>` to install from a local checkout instead of GitHub — useful for
+> deploying unreleased changes or installing without internet access.
 
 ---
 
@@ -153,7 +165,7 @@ Edit `/etc/door_access/config.json` before starting the service:
 | Key | Purpose |
 |-----|---------|
 | `doors[]` | One entry per door: `name`, `sensor_pin` (BCM), `active_low` (LOW = open). Each becomes its own HA `binary_sensor` |
-| `lock.unlock_duration_seconds` | Default seconds the lock stays released (also settable live from HA's **Unlock Duration** number entity; changes persist here) |
+| `lock.unlock_duration_seconds` | Seconds the lock stays released after an authorized tag, button press, or web unlock (also settable live from the [Web Admin](#unlock-duration) status page; changes persist here) |
 | `mqtt.discovery` | Publish Home Assistant MQTT discovery configs so entities auto-appear (default `true`) |
 | `mqtt.discovery_prefix` | HA discovery prefix (default `homeassistant`) |
 | `reader_feedback.enabled` | Beep + LED feedback on the reader for each scan (default `true`) |
@@ -205,6 +217,110 @@ sudo systemctl stop door_access
 
 ---
 
+## Web Admin
+
+A separate service (`door_admin.service`) serves a small HTTPS site on the Pi for
+managing tags, viewing event history, and — unlike Home Assistant — unlocking the door.
+
+```
+https://<pi-ip>:8443
+```
+
+**Why unlock lives here and not in Home Assistant.** HA has no per-user access control:
+every HA user shares one set of entity permissions, so an HA unlock button is an unlock
+button for everyone in the house. This service authenticates each operator individually
+against their own Pi account and additionally requires membership in the `dooradmin`
+group, and it records who did what.
+
+### Access control
+
+| Layer | Check |
+|-------|-------|
+| Password | PAM against local Pi accounts (`login` service) |
+| Authorization | Must be a member of `dooradmin` — a valid Pi password alone is not enough |
+| Lockout | 5 failed attempts from one IP locks that IP out for 15 minutes |
+| Audit | Logins, failures, unlocks and tag changes are all written to the event history |
+
+Grant and revoke access with normal Unix group membership:
+
+```bash
+sudo usermod -aG dooradmin alice     # grant
+sudo gpasswd -d alice dooradmin      # revoke
+```
+
+Revoking takes effect at their next login; to cut an active session immediately, restart
+the service (`sudo systemctl restart door_admin`), which invalidates all sessions.
+
+To take the unlock button away entirely and leave a monitoring-and-tags UI, set
+`"allow_unlock": false` in `/etc/door_access/web.json` and restart `door_admin`.
+
+### Unlock duration
+
+Set on the **Status** page (1–60 seconds). It applies to every unlock — NFC tag, physical
+button, and the web unlock button — takes effect on the next unlock, and persists to
+`config.json`, so it survives a restart. Changes are recorded in the event history against
+your username. An unlock already counting down keeps its original timer.
+
+### Adding a tag
+
+Three ways, all on the **Tags** page:
+
+1. **From a recent unknown scan** *(no setup)* — present the card at the door reader. It's
+   denied and logged; the UID then appears under *Recent unknown scans*. Click **Use this
+   UID**, type a name, **Add tag**.
+2. **With your phone's NFC** *(Chrome on Android)* — tap **Scan a tag with this phone** and
+   hold the card to the back of the phone. The UID fills itself in.
+3. **By hand** — type the UID. Any separator style works; `aa:bb:11:22` and `AABB1122` are
+   the same tag.
+
+Changes take effect immediately — no restart.
+
+> **Phone NFC needs the CA installed.** The Web NFC API only exists in Chrome on Android,
+> and only in a secure context. With the self-signed setup the installer generates, that
+> means installing `/etc/door_access/tls/ca.pem` on the phone first
+> (**Settings → Security → Encryption & credentials → Install a certificate → CA
+> certificate**). Until then the button simply doesn't appear. **iOS cannot do this at
+> all** — Safari does not implement Web NFC — so on an iPhone use method 1 or 3.
+
+### Event history
+
+Every scan (granted and denied), button press, web unlock, door open/close, alert, tag
+change and login attempt is written to `/var/lib/door_access/events.db`, filterable and
+paginated under **History**. Retention defaults to 90 days
+(`web.event_retention_days` in `config.json`).
+
+The history starts from the moment you install this version — earlier activity only
+exists in `door_access.log` and is not backfilled.
+
+### How the two services are separated
+
+The web app runs as its own user (`doorweb`) and holds **no** GPIO access and **no** write
+access to `config.json`. Everything it changes it requests over a Unix socket
+(`/run/door_access/control.sock`, mode 0660, group `dooradmin`), and the door service
+executes it on its single event-loop thread — so config writes and GPIO stay
+single-threaded, as everywhere else in this project.
+
+`doorweb` is in the `shadow` group so PAM can verify passwords. That is a real privilege —
+it can read password hashes — so the account has no shell, no home directory, and the unit
+is locked down with `ProtectSystem=strict` and friends.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---------|-------|
+| "door service is not running" | `door_access.service` is down — the socket only exists while it runs |
+| "no permission for /run/door_access/control.sock" | `doorweb` is not in `dooradmin`, or `door` isn't either (it needs to be, to hand over the socket) |
+| Correct password rejected | The account is not in `dooradmin`; the message is deliberately identical to a wrong password |
+| "Authentication is not configured" | `python-pam` missing from `/opt/door_access/venv` |
+| Browser warns about the certificate | Expected until `tls/ca.pem` is installed on the device |
+| Scan button missing on Android | Not HTTPS-trusted yet — install `ca.pem`; Web NFC is hidden in insecure contexts |
+
+```bash
+journalctl -u door_admin -f
+```
+
+---
+
 ## MQTT Topics
 
 ### Published by the Pi
@@ -217,24 +333,18 @@ sudo systemctl stop door_access
 | `home/door/alert` | No | Alert message string |
 | `home/door/last_access` | Yes | JSON (see below) |
 | `home/door/nfc/tag` | No | Raw UID of every scan (for HA's MQTT tag scanner) |
-| `home/door/unlock_duration/state` | Yes | Current unlock duration (seconds) |
-| `home/door/enroll/state` | Yes | `ON` / `OFF` — enroll mode armed state |
-| `home/door/enroll_name/state` | Yes | Name to assign the next enrolled tag |
-| `home/door/known_tags/state` | Yes | Currently selected known tag (for removal) |
 
 Discovery configs are also published (retained) under `homeassistant/.../config` when
 `mqtt.discovery` is enabled — see the Home Assistant section below.
 
 ### Subscribed by the Pi
 
-| Topic | Payload |
-|-------|---------|
-| `home/door/lock/set` | `LOCK` or `UNLOCK` |
-| `home/door/unlock_duration/set` | Number of seconds (1–60) to set the unlock duration |
-| `home/door/enroll/set` | `ON` / `OFF` — arm (one-shot) or disarm tag enrollment |
-| `home/door/enroll_name/set` | Name to assign the next enrolled tag |
-| `home/door/known_tags/set` | Select a known tag name (for removal) |
-| `home/door/remove_tag/set` | `PRESS` — remove the currently selected known tag |
+**Nothing.** The Pi subscribes to no MQTT topics at all — the connection is publish-only.
+
+> Home Assistant has no per-user access control, so anything writable over MQTT is
+> writable by every HA user, and by anyone who can publish to the broker. The door
+> opens only from an authorized NFC tag, the physical button, or the
+> [Web Admin](#web-admin), which authenticates each operator individually.
 
 ### last_access JSON format
 
@@ -255,12 +365,12 @@ Discovery configs are also published (retained) under `homeassistant/.../config`
 | `UNAUTHORIZED_ACCESS uid=...` | Unrecognized NFC UID |
 | `BUTTON_UNLOCK` | Momentary button pressed |
 | `DOOR_OPEN_TOO_LONG elapsed=...s` | Door open past threshold |
-| `TAG_ENROLLED uid=... name=...` | New tag captured via enroll mode |
-| `TAG_ALREADY_ENROLLED uid=... name=...` | Enroll scan of an already-known tag |
-| `TAG_REMOVED name=... count=...` | Tag(s) removed via **Remove Selected Tag** |
-| `TAG_REMOVE_NOMATCH name=...` | Remove pressed with no matching tag |
 
 ### Home Assistant integration
+
+Home Assistant is **monitoring only** — every entity is read-only. HA has no per-user
+access control (all HA users share one set of entity permissions), so nothing exposed
+here can open the door, change who is authorized, or change any setting.
 
 With `mqtt.discovery` enabled (the default), the Pi publishes MQTT discovery configs and
 **all entities appear automatically** — no YAML needed. As long as HA's MQTT integration
@@ -269,34 +379,21 @@ points at the same broker, a **"Door Access"** device shows up under
 
 | Entity | Type | Use |
 |--------|------|-----|
-| Lock | `lock` | **Actuate the door** — unlock = momentary release for the unlock duration, then auto-relock; lock = relock now |
-| Unlock Duration | `number` | **Set how long the lock releases** (1–60 s, default 5) for NFC grants and HA unlocks; persists across restarts |
+| Lock | `binary_sensor` (lock) | Lock status — on = unlocked, off = locked |
 | Door Left / Door Right | `binary_sensor` (door) | Open / closed — one per door |
 | Last Access | `sensor` | **Who scanned** — state = name; attributes `uid`, `granted`, `timestamp` |
 | Alert | `sensor` | Latest alert string (`UNAUTHORIZED_ACCESS …`, `DOOR_OPEN_TOO_LONG …`, etc.) |
 | NFC tag scanner | `tag` | Every scan fires HA's native `tag_scanned`; badges appear under **Settings → Tags** |
-| Enroll Next Tag | `switch` | **Arm enrollment** (one-shot) — the next scanned tag is added |
-| New Tag Name | `text` | Name to assign the next enrolled tag (blank → `Tag <last4>`) |
-| Known Tags | `select` | Pick a known tag by name (options track `authorized_uids`) |
-| Remove Selected Tag | `button` | **Revoke** the tag selected in *Known Tags* |
 
-#### Enroll or remove a tag from Home Assistant
+Upgrading from a version that had the Lock control, the Unlock Duration number, or the
+enrollment entities? The Pi clears their retained discovery configs on connect, so they
+disappear from HA by themselves — no manual cleanup in the broker.
 
-Tags live in `authorized_uids` in the config, but you don't have to edit it by hand — add
-and remove tags entirely from the **Door Access** device:
+#### Managing tags
 
-**Add a tag**
-1. Type the person's name into **New Tag Name** (blank defaults to `Tag <last4>`).
-2. Turn **Enroll Next Tag** ON.
-3. Scan the new tag on the reader.
-
-The Pi writes `UID → name` into the config, saves it, the reader **beeps + flashes green**,
-and the switch flips itself back OFF. The tag works immediately — no restart. Enrollment is
-one-shot and does **not** unlock the door (it's an admin action).
-
-**Remove a tag** — pick the name in **Known Tags**, then press **Remove Selected Tag**. This
-works for a lost tag too, since you select by name rather than scanning. The *Known Tags*
-options refresh automatically after any add or remove.
+Not from Home Assistant — use the [Web Admin](#web-admin), which authenticates each
+operator individually. Editing `authorized_uids` in `/etc/door_access/config.json` by hand
+and restarting the service also works.
 
 #### Notify on a denied badge
 
@@ -320,17 +417,16 @@ automation:
 
 ```yaml
 mqtt:
-  lock:
-    - name: "Cabinet Door"
+  binary_sensor:
+    # Read-only lock status. Do NOT define an `mqtt: lock:` entity here — it needs a
+    # command_topic, and the Pi no longer subscribes to one.
+    - name: "Cabinet Door Lock"
       state_topic: "home/door/lock/state"
-      command_topic: "home/door/lock/set"
-      payload_lock: "LOCK"
-      payload_unlock: "UNLOCK"
-      state_locked: "LOCKED"
-      state_unlocked: "UNLOCKED"
+      payload_on: "UNLOCKED"
+      payload_off: "LOCKED"
+      device_class: lock
       availability_topic: "home/door/availability"
 
-  binary_sensor:
     - name: "Cabinet Door Sensor"
       state_topic: "home/door/sensor/state"
       payload_on: "OPEN"
@@ -394,15 +490,28 @@ Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough 
   lock_controller.py    Relay, LED, button (RPi.GPIO)
   door_sensor.py        Reed switch (RPi.GPIO)
   mqtt_handler.py       Home Assistant MQTT integration + discovery + tag scanner (paho-mqtt)
+  event_store.py        SQLite event history (writer for the door service, reader for the web UI)
+  control_socket.py     Unix-socket protocol between the web UI and the door service
+  web_admin.py          Flask web admin (runs as 'doorweb' under door_admin.service)
+  templates/  static/   Web admin pages and assets
+  venv/                 Web admin dependencies (Flask, gunicorn, python-pam)
 
 /etc/door_access/
-  config.json           Runtime configuration (edit this file)
+  config.json           Door service configuration (door-owned; holds the MQTT password)
+  web.json              Web admin settings (admin group, session length, unlock toggle)
+  web.env               Web admin listen address (gunicorn --bind)
+  web_secret            Session signing key (doorweb-owned, 0600)
+  tls/                  ca.pem, cert.pem, key.pem for the web admin
+
+/var/lib/door_access/
+  events.db             Event history (SQLite, WAL; setgid dir so the web UI can read it)
 
 /var/log/door_access/
   door_access.log       Application log (rotated daily, 7 days kept; door-owned dir so rotation works)
 
 /etc/systemd/system/
-  door_access.service   systemd unit file
+  door_access.service   Door service unit
+  door_admin.service    Web admin unit
 
 /etc/polkit-1/rules.d/
   50-door-pcsc.rules    Grants the 'door' service user PC/SC access

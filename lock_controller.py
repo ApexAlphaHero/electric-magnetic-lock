@@ -82,7 +82,8 @@ class LockController:
 
     def set_default_duration(self, seconds: float) -> None:
         """Update the auto-relock duration used by unlock() when no explicit
-        duration is given (settable from Home Assistant at runtime)."""
+        duration is given. Set from the web admin; takes effect on the next
+        unlock (an unlock already in progress keeps its original timer)."""
         self._default_duration = seconds
 
     def get_state(self) -> str:

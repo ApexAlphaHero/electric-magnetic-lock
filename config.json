@@ -39,6 +39,12 @@
   "reader_feedback": {
     "enabled": true
   },
+  "web": {
+    "enabled": true,
+    "control_socket": "/run/door_access/control.sock",
+    "event_db": "/var/lib/door_access/events.db",
+    "event_retention_days": 90
+  },
   "authorized_uids": {
     "AABB1122": "Alice",
     "CCDD3344": "Bob"

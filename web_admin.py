@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Door Access web admin.
+
+A small Flask app, run as its own unprivileged user (`doorweb`) under its own
+systemd unit, separate from the door service. It holds no GPIO and no write
+access to the door's config: every change is a request over the control socket,
+executed by the door service's event loop.
+
+Authentication is PAM against local Pi accounts, then a hard requirement of
+membership in the `dooradmin` group — being a valid Pi user is not enough. This
+is the per-user access control Home Assistant could not provide, and the reason
+unlock lives here rather than in HA.
+
+Served over TLS by gunicorn; see door_admin.service.
+"""
+
+import functools
+import grp
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+
+from flask import (Flask, abort, flash, redirect, render_template, request,
+                   session, url_for)
+
+from control_socket import DEFAULT_SOCKET_PATH, ControlClient, normalize_uid
+from event_store import DEFAULT_DB_PATH, EventReader
+
+logger = logging.getLogger(__name__)
+
+WEB_CONFIG_PATH = "/etc/door_access/web.json"
+SECRET_PATH = "/etc/door_access/web_secret"
+
+# The listen address is NOT here — it is gunicorn's --bind, set from
+# /etc/door_access/web.env, so there is exactly one source of truth for it.
+DEFAULTS = {
+    "admin_group": "dooradmin",
+    "session_minutes": 60,
+    "allow_unlock": True,
+    "control_socket": DEFAULT_SOCKET_PATH,
+    "event_db": DEFAULT_DB_PATH,
+    "page_size": 50,
+    "max_login_attempts": 5,
+    "lockout_minutes": 15,
+}
+
+USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+
+
+# ── configuration ───────────────────────────────────────────────────────────────
+
+def load_web_config(path: str = WEB_CONFIG_PATH) -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        logger.warning("%s not found — using defaults", path)
+    except ValueError as e:
+        logger.error("%s is not valid JSON (%s) — using defaults", path, e)
+    return cfg
+
+
+def load_secret(path: str = SECRET_PATH) -> bytes:
+    """Read the session-signing key, creating it if absent.
+
+    It must persist across restarts or every restart logs everyone out, and it
+    must never be a hardcoded default or sessions would be forgeable by anyone
+    who has read the source.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read().strip()
+            if len(data) >= 32:
+                return data
+            logger.warning("%s is too short — regenerating", path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error("Cannot read %s (%s) — using an ephemeral key; sessions will "
+                     "not survive a restart", path, e)
+        return secrets.token_bytes(32)
+
+    key = secrets.token_hex(32).encode()
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        logger.info("Generated new session secret at %s", path)
+    except OSError as e:
+        logger.error("Cannot write %s (%s) — using an ephemeral key", path, e)
+    return key
+
+
+# ── authentication ──────────────────────────────────────────────────────────────
+
+class PAMUnavailable(RuntimeError):
+    pass
+
+
+def pam_authenticate(username: str, password: str) -> bool:
+    """Verify a local account password via PAM.
+
+    Reading /etc/shadow requires privilege, so the service user must be in the
+    `shadow` group — pam_unix then reads it directly. (The setuid helper
+    /usr/sbin/unix_chkpwd is not an option: it only lets a non-root caller check
+    its *own* password.)
+    """
+    try:
+        import pam as pam_module
+    except ImportError as e:
+        # Report the underlying error: this fires for a missing transitive
+        # dependency (python-pam 2.0.2 imports 'six' without declaring it) just
+        # as often as for a genuinely missing package, and the two need
+        # different fixes.
+        raise PAMUnavailable(
+            f"cannot import the PAM binding from the service venv: {e}"
+        ) from e
+
+    authenticator = pam_module.pam()
+    return bool(authenticator.authenticate(username, password, service="login"))
+
+
+def in_admin_group(username: str, group: str) -> bool:
+    """Membership check covering both secondary members and users whose *primary*
+    group is the admin group (those do not appear in gr_mem)."""
+    try:
+        entry = grp.getgrnam(group)
+    except KeyError:
+        logger.error("Admin group %r does not exist — refusing all logins", group)
+        return False
+    if username in entry.gr_mem:
+        return True
+    try:
+        import pwd
+        return pwd.getpwnam(username).pw_gid == entry.gr_gid
+    except KeyError:
+        return False
+
+
+class LoginThrottle:
+    """In-memory lockout after repeated failures.
+
+    Deliberately keyed on the client IP alone so that guessing *different*
+    usernames from one host still trips the same counter. State is per-process,
+    which is why the unit runs a single gunicorn worker.
+    """
+
+    def __init__(self, max_attempts: int, lockout_seconds: float):
+        self._max = max_attempts
+        self._lockout = lockout_seconds
+        self._failures: dict[str, list] = {}
+        self._lock = threading.Lock()
+
+    def locked_for(self, key: str) -> float:
+        with self._lock:
+            count, last = self._failures.get(key, (0, 0.0))
+            if count < self._max:
+                return 0.0
+            remaining = self._lockout - (time.monotonic() - last)
+            if remaining <= 0:
+                self._failures.pop(key, None)
+                return 0.0
+            return remaining
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            count, _ = self._failures.get(key, (0, 0.0))
+            self._failures[key] = (count + 1, time.monotonic())
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
+
+
+# ── app ─────────────────────────────────────────────────────────────────────────
+
+def create_app(cfg: dict | None = None) -> Flask:
+    cfg = cfg or load_web_config()
+    app = Flask(__name__)
+    app.secret_key = load_secret()
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        # The service is TLS-only; without this the cookie could be replayed if
+        # anything ever terminated plain HTTP in front of it.
+        SESSION_COOKIE_SECURE=True,
+        PERMANENT_SESSION_LIFETIME=int(cfg["session_minutes"]) * 60,
+        MAX_CONTENT_LENGTH=64 * 1024,
+    )
+
+    door = ControlClient(cfg["control_socket"])
+    history = EventReader(cfg["event_db"])
+    throttle = LoginThrottle(int(cfg["max_login_attempts"]),
+                             float(cfg["lockout_minutes"]) * 60)
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def current_user() -> str | None:
+        return session.get("user")
+
+    def login_required(view):
+        @functools.wraps(view)
+        def wrapped(*args, **kwargs):
+            if not current_user():
+                return redirect(url_for("login", next=request.path))
+            return view(*args, **kwargs)
+        return wrapped
+
+    def csrf_token() -> str:
+        if "csrf" not in session:
+            session["csrf"] = secrets.token_urlsafe(32)
+        return session["csrf"]
+
+    def require_csrf() -> None:
+        sent = request.form.get("csrf", "")
+        if not sent or not secrets.compare_digest(sent, session.get("csrf", "")):
+            abort(400, "CSRF token missing or invalid")
+
+    def audit(event: str, detail: str = "") -> None:
+        door.call("login_event", event=event, actor=current_user() or "anonymous",
+                  detail=detail)
+
+    @app.context_processor
+    def inject_globals():
+        return {
+            "csrf": csrf_token(),
+            "user": current_user(),
+            "allow_unlock": bool(cfg["allow_unlock"]),
+        }
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        # No external assets anywhere in this app, so the policy can be strict.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
+            "script-src 'self'; form-action 'self'; frame-ancestors 'none'"
+        )
+        return response
+
+    # ── auth routes ────────────────────────────────────────────────────────────
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "GET":
+            return render_template("login.html")
+
+        require_csrf()
+        client = request.remote_addr or "unknown"
+        wait = throttle.locked_for(client)
+        if wait > 0:
+            flash(f"Too many failed attempts. Try again in {int(wait / 60) + 1} minute(s).",
+                  "error")
+            return render_template("login.html"), 429
+
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        # Reject shapes that are not plausible local usernames before they ever
+        # reach PAM.
+        if not username or not USERNAME_RE.match(username) or len(username) > 32:
+            throttle.record_failure(client)
+            flash("Invalid username or password.", "error")
+            return render_template("login.html"), 401
+
+        try:
+            ok = pam_authenticate(username, password)
+        except PAMUnavailable as e:
+            logger.error("PAM unavailable: %s", e)
+            flash("Authentication is not configured on this server.", "error")
+            return render_template("login.html"), 500
+
+        if not ok:
+            throttle.record_failure(client)
+            logger.warning("Failed login for %r from %s", username, client)
+            door.call("login_event", event="WEB_LOGIN_FAILED", actor=username,
+                      detail=f"from {client}")
+            flash("Invalid username or password.", "error")
+            return render_template("login.html"), 401
+
+        if not in_admin_group(username, cfg["admin_group"]):
+            throttle.record_failure(client)
+            logger.warning("User %r authenticated but is not in %s", username, cfg["admin_group"])
+            door.call("login_event", event="WEB_LOGIN_DENIED", actor=username,
+                      detail=f"not in {cfg['admin_group']}, from {client}")
+            # Same message as a bad password: do not confirm which accounts exist.
+            flash("Invalid username or password.", "error")
+            return render_template("login.html"), 403
+
+        throttle.reset(client)
+        session.clear()          # new session id — no fixation carried over
+        session["user"] = username
+        session.permanent = True
+        csrf_token()
+        logger.info("Login: %s from %s", username, client)
+        door.call("login_event", event="WEB_LOGIN", actor=username, detail=f"from {client}")
+
+        target = request.form.get("next") or request.args.get("next") or ""
+        # Only ever redirect within this app.
+        if not target.startswith("/") or target.startswith("//"):
+            target = url_for("dashboard")
+        return redirect(target)
+
+    @app.route("/logout", methods=["POST"])
+    @login_required
+    def logout():
+        require_csrf()
+        audit("WEB_LOGOUT")
+        session.clear()
+        return redirect(url_for("login"))
+
+    # ── pages ──────────────────────────────────────────────────────────────────
+
+    @app.route("/")
+    @login_required
+    def dashboard():
+        status = door.call("status")
+        return render_template(
+            "dashboard.html",
+            status=status.get("result") if status.get("ok") else None,
+            error=None if status.get("ok") else status.get("error"),
+            events=history.recent(limit=15),
+            history_ok=history.available(),
+        )
+
+    @app.route("/unlock", methods=["POST"])
+    @login_required
+    def unlock():
+        require_csrf()
+        if not cfg["allow_unlock"]:
+            abort(403)
+        result = door.call("unlock", actor=current_user())
+        flash("Door unlocked." if result.get("ok")
+              else f"Unlock failed: {result.get('error')}",
+              "success" if result.get("ok") else "error")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/lock", methods=["POST"])
+    @login_required
+    def lock():
+        require_csrf()
+        result = door.call("lock", actor=current_user())
+        flash("Door locked." if result.get("ok")
+              else f"Lock failed: {result.get('error')}",
+              "success" if result.get("ok") else "error")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/unlock_duration", methods=["POST"])
+    @login_required
+    def set_unlock_duration():
+        require_csrf()
+        raw = request.form.get("seconds", "").strip()
+        try:
+            seconds = float(raw)
+        except ValueError:
+            flash(f"{raw!r} is not a number.", "error")
+            return redirect(url_for("dashboard"))
+        # The door service re-validates the range; this is only so the operator
+        # gets a useful message instead of a generic failure.
+        if not 1 <= seconds <= 60:
+            flash("Unlock duration must be between 1 and 60 seconds.", "error")
+            return redirect(url_for("dashboard"))
+        result = door.call("set_unlock_duration", seconds=seconds, actor=current_user())
+        flash(f"Unlock duration set to {seconds:.0f} seconds." if result.get("ok")
+              else f"Could not set duration: {result.get('error')}",
+              "success" if result.get("ok") else "error")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/tags")
+    @login_required
+    def tags():
+        listing = door.call("list_tags")
+        return render_template(
+            "tags.html",
+            tags=listing.get("result") if listing.get("ok") else [],
+            error=None if listing.get("ok") else listing.get("error"),
+            unknown=history.unknown_uids(limit=10),
+            prefill_uid=normalize_uid(request.args.get("uid", "")),
+        )
+
+    @app.route("/tags/add", methods=["POST"])
+    @login_required
+    def add_tag():
+        require_csrf()
+        uid = request.form.get("uid", "")
+        name = request.form.get("name", "")
+        if not normalize_uid(uid):
+            flash(f"{uid!r} is not a valid tag UID — expected hex like AABB1122.", "error")
+            return redirect(url_for("tags"))
+        result = door.call("add_tag", uid=uid, name=name, actor=current_user())
+        if result.get("ok"):
+            added = result["result"]
+            flash(f"Added {added['name']} ({added['uid']}).", "success")
+        else:
+            flash(f"Could not add tag: {result.get('error')}", "error")
+        return redirect(url_for("tags"))
+
+    @app.route("/tags/remove", methods=["POST"])
+    @login_required
+    def remove_tag():
+        require_csrf()
+        result = door.call("remove_tag", uid=request.form.get("uid", ""),
+                           actor=current_user())
+        if result.get("ok"):
+            flash(f"Removed {result['result']['name']}.", "success")
+        else:
+            flash(f"Could not remove tag: {result.get('error')}", "error")
+        return redirect(url_for("tags"))
+
+    @app.route("/tags/rename", methods=["POST"])
+    @login_required
+    def rename_tag():
+        require_csrf()
+        result = door.call("rename_tag", uid=request.form.get("uid", ""),
+                           name=request.form.get("name", ""), actor=current_user())
+        if result.get("ok"):
+            flash(f"Renamed to {result['result']['name']}.", "success")
+        else:
+            flash(f"Could not rename tag: {result.get('error')}", "error")
+        return redirect(url_for("tags"))
+
+    @app.route("/history")
+    @login_required
+    def history_page():
+        page_size = int(cfg["page_size"])
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+        except ValueError:
+            page = 1
+        etype = request.args.get("type", "")
+        query = request.args.get("q", "").strip()[:64]
+        total = history.count(type=etype, query=query)
+        return render_template(
+            "history.html",
+            events=history.recent(limit=page_size, offset=(page - 1) * page_size,
+                                  type=etype, query=query),
+            page=page,
+            pages=max(1, (total + page_size - 1) // page_size),
+            total=total,
+            etype=etype,
+            query=query,
+            all_types=history.types(),
+            history_ok=history.available(),
+        )
+
+    @app.errorhandler(400)
+    def bad_request(e):
+        return render_template("error.html", code=400, message=str(e)), 400
+
+    @app.errorhandler(403)
+    def forbidden(e):
+        return render_template("error.html", code=403, message="Not permitted."), 403
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return render_template("error.html", code=404, message="No such page."), 404
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    # Development only — production runs under gunicorn with TLS (see
+    # door_admin.service). Flask's dev server is not a production server, so
+    # this binds loopback only.
+    logging.basicConfig(level=logging.INFO)
+    app.run(host="127.0.0.1", port=8443, debug=False)

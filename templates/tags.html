@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Tags — Door Access{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Add a tag</h2>
+
+  <form method="post" action="{{ url_for('add_tag') }}" class="addform">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+
+    <div class="field">
+      <label for="uid">Tag UID</label>
+      <input id="uid" name="uid" value="{{ prefill_uid }}" placeholder="AABB1122"
+             autocapitalize="characters" autocorrect="off" spellcheck="false" required>
+      <p class="muted small">Hex, with or without separators — <code>aa:bb:11:22</code> works too.</p>
+    </div>
+
+    <div class="field">
+      <label for="name">Name</label>
+      <input id="name" name="name" placeholder="Alice" maxlength="64">
+      <p class="muted small">Blank names become <code>Tag &lt;last 4&gt;</code>.</p>
+    </div>
+
+    <div class="field">
+      <button type="submit" class="primary">Add tag</button>
+    </div>
+  </form>
+
+  {# Shown only where the Web NFC API actually exists — Chrome on Android over
+     HTTPS. static/nfc.js unhides it. #}
+  <div id="nfc-panel" class="nfc hidden">
+    <button type="button" id="nfc-scan">Scan a tag with this phone</button>
+    <span id="nfc-status" class="muted small"></span>
+  </div>
+  <p id="nfc-unsupported" class="muted small hidden">
+    This browser has no NFC access. Scan the tag at the door reader and pick it up
+    from <em>Recent unknown scans</em> below, or type the UID in by hand.
+  </p>
+</div>
+
+{% if unknown %}
+<div class="card">
+  <h2>Recent unknown scans</h2>
+  <p class="muted small">
+    Tags presented at the reader and denied. Scan a new card at the door, then add it here.
+  </p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>UID</th><th>Last seen (UTC)</th><th>Scans</th><th></th></tr></thead>
+      <tbody>
+        {% for u in unknown %}
+          <tr>
+            <td class="mono">{{ u.uid }}</td>
+            <td class="mono nowrap">{{ u.ts|replace('T', ' ')|replace('+00:00', '') }}</td>
+            <td>{{ u.hits }}</td>
+            <td><a class="button" href="{{ url_for('tags', uid=u.uid) }}#uid">Use this UID</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Authorized tags {% if tags %}<span class="muted">({{ tags|length }})</span>{% endif %}</h2>
+
+  {% if error %}
+    <p class="muted">Could not read the tag list: {{ error }}</p>
+  {% elif not tags %}
+    <p class="muted">No tags are authorized. Nobody can open the door with a card.</p>
+  {% else %}
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Name</th><th>UID</th><th></th></tr></thead>
+        <tbody>
+          {% for t in tags %}
+            <tr>
+              <td>
+                <form method="post" action="{{ url_for('rename_tag') }}" class="inline">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <input type="hidden" name="uid" value="{{ t.uid }}">
+                  <input name="name" value="{{ t.name }}" maxlength="64" aria-label="Name">
+                  <button type="submit" class="link">Rename</button>
+                </form>
+              </td>
+              <td class="mono">{{ t.uid }}</td>
+              <td>
+                <form method="post" action="{{ url_for('remove_tag') }}" class="inline">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <input type="hidden" name="uid" value="{{ t.uid }}">
+                  <button type="submit" class="danger"
+                          data-confirm="Remove {{ t.name }}? This tag will stop opening the door immediately.">
+                    Remove
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='nfc.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,6 @@
+# Everything in this repo is deployed straight to Linux — either curl'd from
+# raw.githubusercontent by install.sh, or copied up with pscp/scp. Windows
+# checkouts must therefore keep LF endings: a CRLF install.sh fails on the Pi
+# with `$'\r': command not found`, and CRLF systemd units are not parsed
+# reliably. This overrides a global core.autocrlf=true.
+* text=auto eol=lf

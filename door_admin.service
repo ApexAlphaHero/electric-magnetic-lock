@@ -1,0 +1,68 @@
+[Unit]
+Description=Door Access Web Admin
+After=network-online.target door_access.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=doorweb
+Group=doorweb
+# shadow    — pam_unix reads /etc/shadow directly to verify passwords. The
+#             setuid helper unix_chkpwd is not usable here: it only lets a
+#             non-root caller check its *own* password.
+# dooradmin — permission to open the door service's control socket and to read
+#             the event database.
+SupplementaryGroups=shadow dooradmin
+
+WorkingDirectory=/opt/door_access
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/door_access
+EnvironmentFile=/etc/door_access/web.env
+
+# doorweb is a --no-create-home system account, but gunicorn's control server
+# wants a writable HOME. Point it at a systemd-managed runtime directory rather
+# than giving the service account a real home.
+RuntimeDirectory=door_admin
+RuntimeDirectoryMode=0750
+Environment=HOME=/run/door_admin
+
+ExecStart=/opt/door_access/venv/bin/gunicorn \
+    --bind ${DOOR_WEB_BIND} \
+    --workers 1 --threads 4 \
+    --certfile /etc/door_access/tls/cert.pem \
+    --keyfile /etc/door_access/tls/key.pem \
+    --access-logfile - --error-logfile - \
+    web_admin:app
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=door_admin
+
+# Hardening. The web app needs no privileges beyond reading /etc/shadow via PAM,
+# reaching the control socket, and reading the event database.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# ProtectSystem=strict makes the whole tree read-only, so every path the service
+# legitimately writes has to be named. /etc/door_access holds the session secret;
+# the event DB needs its directory writable for SQLite's WAL sidecar files even
+# though the app itself only ever reads (enforced with PRAGMA query_only).
+# The control socket directory is created by door_access.service, so it is
+# optional (-) — the web UI must still start if the door service is down.
+ReadWritePaths=/etc/door_access
+ReadWritePaths=/var/lib/door_access
+ReadWritePaths=-/run/door_access
+
+[Install]
+WantedBy=multi-user.target

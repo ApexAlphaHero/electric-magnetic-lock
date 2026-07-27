@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Status — Door Access{% endblock %}
+
+{% block content %}
+{% if error %}
+  <div class="card warn">
+    <strong>Door service unreachable.</strong>
+    <p class="muted">{{ error }}</p>
+  </div>
+{% else %}
+  <div class="card">
+    <div class="statusrow">
+      <div class="stat">
+        <span class="label">Lock</span>
+        <span class="value {{ 'open' if status.lock == 'UNLOCKED' else 'shut' }}">
+          {{ status.lock|title }}
+        </span>
+      </div>
+      <div class="stat">
+        <span class="label">Unlock duration</span>
+        <form method="post" action="{{ url_for('set_unlock_duration') }}" class="inline duration">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label for="seconds" class="sr">Unlock duration in seconds</label>
+          <input id="seconds" name="seconds" type="number" min="1" max="60" step="1"
+                 value="{{ status.unlock_duration|int }}" required>
+          <span class="unit">s</span>
+          <button type="submit">Save</button>
+        </form>
+      </div>
+      <div class="stat">
+        <span class="label">Enrolled tags</span>
+        <span class="value">{{ status.tag_count }}</span>
+      </div>
+    </div>
+
+    {% if allow_unlock %}
+      <div class="actions">
+        <form method="post" action="{{ url_for('unlock') }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit" class="primary big">Unlock door</button>
+        </form>
+        <form method="post" action="{{ url_for('lock') }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">Lock now</button>
+        </form>
+      </div>
+      <p class="muted small">
+        Unlock releases the lock for {{ status.unlock_duration|int }} seconds, then it
+        re-engages automatically. The same duration applies to tag and button unlocks.
+        Every use is recorded against your username.
+      </p>
+    {% endif %}
+  </div>
+{% endif %}
+
+<div class="card">
+  <h2>Recent activity</h2>
+  {% if not history_ok %}
+    <p class="muted">Event history is unavailable — check that the door service is running.</p>
+  {% elif not events %}
+    <p class="muted">No events recorded yet.</p>
+  {% else %}
+    {% include "_events_table.html" %}
+    <p><a href="{{ url_for('history_page') }}">Full history →</a></p>
+  {% endif %}
+</div>
+{% endblock %}
