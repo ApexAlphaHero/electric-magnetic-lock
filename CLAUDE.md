@@ -52,6 +52,7 @@ The web app has **no** privilege to install anything. It runs `systemctl --no-bl
 
 - **Auto-rollback is the point.** If `door_access` isn't active after the restart, `update.sh` resets to the previous commit, reinstalls, and restarts. A broken release must never leave the door unmanaged. Preserve this if you touch the script.
 - **`--ff-only` and a pinned remote.** It refuses a non-fast-forward (so hand-edits on the Pi fail loudly rather than being discarded) and refuses any origin but the configured URL (otherwise rewriting the remote turns the update button into arbitrary root execution).
+- **`raw.githubusercontent.com` caches ~5 minutes**, so `curl | bash` right after a push silently installs stale files. The updater is immune (it fetches over git and installs from the checkout with `DOOR_SRC_DIR`); only the bootstrap one-liner is affected. When deploying a just-pushed change by hand, go through the checkout.
 - **Status lives on disk, not in the request.** Applying an update restarts `door_admin`, killing the browser's connection; `updates.js` treats fetch failures during a run as "restarting" and reloads once the server returns.
 - **`install.sh` must stay non-interactive under the updater.** `grant_web_admins` tests `${DOOR_WEB_ADMINS+x}` (set, not non-empty) so the updater can pass an empty value to skip the prompt — `read` at EOF would otherwise abort the script under `set -e`.
 - **Security posture:** a `dooradmin` web session is effectively root on this box. That is documented, not accidental; `"allow_update": false` removes the page.

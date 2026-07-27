@@ -107,6 +107,19 @@ The installer will:
 > Set `DOOR_SRC_DIR=<path>` to install from a local checkout instead of GitHub — useful for
 > deploying unreleased changes or installing without internet access.
 
+> **`raw.githubusercontent.com` caches for a few minutes.** Running the one-liner
+> immediately after pushing can install stale files, with no error to tell you. If you've
+> just pushed, either wait ~5 minutes or install from the git checkout instead, which reads
+> the commit directly and is never cached:
+>
+> ```bash
+> sudo git -C /opt/door_access/repo pull --ff-only
+> sudo DOOR_SRC_DIR=/opt/door_access/repo DOOR_WEB_ADMINS= bash /opt/door_access/repo/install.sh
+> ```
+>
+> The web **Updates** page is not affected — it fetches over git, then installs from the
+> checkout.
+
 ---
 
 ## Configuration
