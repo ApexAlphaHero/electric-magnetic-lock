@@ -305,6 +305,35 @@ over a connection you haven't verified. A CA certificate is a public key — pub
 grants nobody anything. The signing key (`ca-key.pem`) is `0640 root:dooradmin` and is
 never served.
 
+### Updating
+
+The **Updates** page shows the installed commit and anything newer on `master`. **Check for
+updates** fetches; **Update now** fast-forwards the checkout at `/opt/door_access/repo`,
+re-runs the installer from it, and restarts both services. The page survives its own server
+restarting and reports the result when it comes back.
+
+**If the door service doesn't come back within a few seconds, the update is rolled back
+automatically** and the previous version reinstalled — a bad release can't leave the lock
+unmanaged. If both the update *and* the rollback fail, the page says so explicitly; recover
+with `journalctl -u door_access -n 50`.
+
+It refuses to run if the checkout has local edits (it's `--ff-only`), and refuses any git
+remote other than the configured one.
+
+> **This is remote code execution as root, gated on a `dooradmin` session.** Anyone who can
+> sign in to the web admin can cause code from the git remote to run as root on the Pi. The
+> web app itself holds no such privilege — it may only ask systemd to start two specific
+> units, via `/etc/sudoers.d/door_update` — but the end result is the same, so treat
+> `dooradmin` membership as equivalent to root on this machine. Set
+> `"allow_update": false` in `/etc/door_access/web.json` to remove the page entirely and
+> update by hand instead:
+>
+> ```bash
+> sudo git -C /opt/door_access/repo pull
+> sudo DOOR_SRC_DIR=/opt/door_access/repo DOOR_WEB_ADMINS= bash /opt/door_access/repo/install.sh
+> sudo systemctl restart door_access door_admin
+> ```
+
 ### Event history
 
 Every scan (granted and denied), button press, web unlock, door open/close, alert, tag

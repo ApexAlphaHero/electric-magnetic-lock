@@ -13,6 +13,9 @@
   <a href="{{ url_for('dashboard') }}" class="{{ 'on' if request.endpoint == 'dashboard' }}">Status</a>
   <a href="{{ url_for('tags') }}" class="{{ 'on' if request.endpoint == 'tags' }}">Tags</a>
   <a href="{{ url_for('history_page') }}" class="{{ 'on' if request.endpoint == 'history_page' }}">History</a>
+  {% if allow_update %}
+    <a href="{{ url_for('updates') }}" class="{{ 'on' if request.endpoint == 'updates' }}">Updates</a>
+  {% endif %}
   <a href="{{ url_for('ca_certificate') }}" title="Install on a device to trust this site">Certificate</a>
   <form method="post" action="{{ url_for('logout') }}" class="nav-right">
     <input type="hidden" name="csrf" value="{{ csrf }}">

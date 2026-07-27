@@ -1,0 +1,17 @@
+[Unit]
+Description=Door Access — check for updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Read-only against the deployment: fetches and reports, never installs. Kept as
+# a separate unit from door_update.service so the web admin can be allowed to
+# check for updates without being allowed to apply one.
+ExecStart=/opt/door_access/update.sh check
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=door_update

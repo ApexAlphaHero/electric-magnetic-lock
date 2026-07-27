@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Updates — Door Access{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Software update</h2>
+
+  <div class="statusrow">
+    <div class="stat">
+      <span class="label">Installed</span>
+      <span class="value mono" id="current-sha">
+        {{ status.current.sha if status.current else "unknown" }}
+      </span>
+      {% if status.current %}
+        <span class="muted small">{{ status.current.subject }}</span>
+      {% endif %}
+    </div>
+    <div class="stat">
+      <span class="label">Available</span>
+      <span class="value" id="behind">{{ status.behind or 0 }}</span>
+      <span class="muted small">
+        new commit{{ '' if status.behind == 1 else 's' }} on {{ status.branch or 'master' }}
+      </span>
+    </div>
+  </div>
+
+  <div class="scanrow">
+    <button type="button" id="check" data-csrf="{{ csrf }}">Check for updates</button>
+    <button type="button" id="apply" class="primary {{ '' if status.behind else 'hidden' }}"
+            data-csrf="{{ csrf }}"
+            data-confirm="Apply this update? The door service and this web UI will both restart. If the door service fails to come back, the update is rolled back automatically.">
+      Update now
+    </button>
+    <span id="update-status" class="muted small" role="status" aria-live="polite">{{ status.message or '' }}</span>
+  </div>
+
+  {% if status.last_checked %}
+    <p class="muted small">Last checked {{ status.last_checked|replace('T', ' ')|replace('+00:00', '') }} UTC.</p>
+  {% endif %}
+</div>
+
+<div class="card" id="pending-card" {{ '' if status.pending else 'hidden' }}>
+  <h2>Pending changes</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Commit</th><th>Description</th><th>Date</th></tr></thead>
+      <tbody id="pending-body">
+        {% for c in status.pending %}
+          <tr>
+            <td class="mono nowrap">{{ c.sha }}</td>
+            <td>{{ c.subject }}</td>
+            <td class="mono nowrap">{{ c.date|replace('T', ' ') }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>What an update does</h2>
+  <p class="muted small">
+    Fast-forwards the checkout at <code>/opt/door_access/repo</code> from the configured git
+    remote, re-runs the installer from it, then restarts the door service. If the door
+    service does not come back within a few seconds the update is <strong>rolled back
+    automatically</strong> and the previous version reinstalled — the lock is never left
+    unmanaged by a bad release.
+  </p>
+  <p class="muted small">
+    It will not run if the checkout has local edits, and it refuses any git remote other
+    than the configured one. This page can be removed entirely with
+    <code>"allow_update": false</code> in <code>/etc/door_access/web.json</code>.
+  </p>
+</div>
+
+{% if log %}
+<div class="card">
+  <h2>Update log</h2>
+  <pre class="log" id="update-log">{{ log }}</pre>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='updates.js') }}"></script>
+{% endblock %}

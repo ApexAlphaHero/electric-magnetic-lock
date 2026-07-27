@@ -1,0 +1,19 @@
+[Unit]
+Description=Door Access — apply update
+# Not WantedBy anything: started on demand by the web admin, via a sudoers rule
+# that permits exactly `systemctl start door_update.service` and nothing else.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/door_access/update.sh apply
+# The update restarts door_access and door_admin. Without this, systemd would
+# tear this unit down as part of restarting the service that started it.
+KillMode=process
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=door_update

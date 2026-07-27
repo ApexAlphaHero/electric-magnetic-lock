@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 
@@ -44,6 +45,9 @@ DEFAULTS = {
     "control_socket": DEFAULT_SOCKET_PATH,
     "event_db": DEFAULT_DB_PATH,
     "tls_ca": "/etc/door_access/tls/ca.pem",
+    "allow_update": True,
+    "update_status": "/var/lib/door_access/update-status.json",
+    "update_log": "/var/lib/door_access/update.log",
     "page_size": 50,
     "max_login_attempts": 5,
     "lockout_minutes": 15,
@@ -232,6 +236,7 @@ def create_app(cfg: dict | None = None) -> Flask:
             "csrf": csrf_token(),
             "user": current_user(),
             "allow_unlock": bool(cfg["allow_unlock"]),
+            "allow_update": bool(cfg["allow_update"]),
         }
 
     @app.after_request
@@ -502,6 +507,86 @@ def create_app(cfg: dict | None = None) -> Flask:
             all_types=history.types(),
             history_ok=history.available(),
         )
+
+    # ── updates ────────────────────────────────────────────────────────────────
+    # The web app has no privilege to install anything. It may only ask systemd
+    # to start one of two units (see /etc/sudoers.d/door_update); everything
+    # else here is reading files those units wrote.
+
+    def update_enabled() -> bool:
+        return bool(cfg["allow_update"])
+
+    def read_update_status() -> dict:
+        try:
+            with open(cfg["update_status"]) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {"state": "unknown", "message": "No update has been run yet.",
+                    "behind": 0, "pending": []}
+        except Exception as e:
+            return {"state": "error", "message": f"Cannot read update status: {e}",
+                    "behind": 0, "pending": []}
+
+    def start_unit(unit: str) -> dict:
+        try:
+            done = subprocess.run(
+                ["sudo", "-n", "/usr/bin/systemctl", "start", unit],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"{unit} did not start within 30s"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if done.returncode != 0:
+            detail = (done.stderr or done.stdout or "").strip()[:300]
+            logger.error("Could not start %s: %s", unit, detail)
+            return {"ok": False, "error": detail or f"systemctl start {unit} failed"}
+        return {"ok": True}
+
+    @app.route("/updates")
+    @login_required
+    def updates():
+        if not update_enabled():
+            abort(403)
+        log_tail = ""
+        try:
+            with open(cfg["update_log"]) as f:
+                # Tail without holding the whole file: these logs accumulate
+                # across every update ever run.
+                log_tail = "".join(f.readlines()[-120:])
+        except OSError:
+            pass
+        return render_template("updates.html", status=read_update_status(), log=log_tail)
+
+    @app.route("/updates/status")
+    @login_required
+    def updates_status():
+        if not update_enabled():
+            abort(403)
+        return jsonify(read_update_status())
+
+    @app.route("/updates/check", methods=["POST"])
+    @login_required
+    def updates_check():
+        require_csrf()
+        if not update_enabled():
+            abort(403)
+        audit("UPDATE_CHECK")
+        return jsonify(start_unit("door_update_check.service"))
+
+    @app.route("/updates/apply", methods=["POST"])
+    @login_required
+    def updates_apply():
+        require_csrf()
+        if not update_enabled():
+            abort(403)
+        status = read_update_status()
+        target = (status.get("pending") or [{}])[0].get("sha", "?")
+        # Audited before starting: door_admin is restarted by the update, so
+        # recording it afterwards is not guaranteed to happen.
+        audit("UPDATE_APPLY", f"to {target}, from {status.get('current', {}).get('sha', '?')}")
+        logger.warning("Update applied by %s", current_user())
+        return jsonify(start_unit("door_update.service"))
 
     @app.errorhandler(400)
     def bad_request(e):

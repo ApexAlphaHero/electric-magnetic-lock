@@ -42,6 +42,18 @@ Flask + gunicorn (TLS), runs as `doorweb`, separate from the door service. Depen
 - **Web NFC is progressive enhancement only, and usually unavailable.** Chromium-on-Android + trusted secure context. **Firefox has no Web NFC on any platform and no iOS browser does** — this is the user's own browser, so never present phone scanning as the default or assume it will work. The button stays hidden unless `NDEFReader` exists; the fallback text distinguishes "certificate not trusted" from "wrong browser" so nobody is sent to install a CA that won't help them.
 - **`/ca.crt` is intentionally unauthenticated.** You need the CA *before* the connection is trustworthy; gating it behind login would mean sending a password over an unverified connection. It serves the public CA cert only — `ca-key.pem` is never exposed. Sent as `.crt` with `application/x-x509-ca-cert` because Android's certificate installer filters the picker by extension and skips `.pem`.
 
+## In-place updates
+
+`/opt/door_access/repo` is a root-owned git checkout — the *source* the updater installs from, not the running code (that stays in `/opt/door_access`). Keep it root-owned and non-group-writable: write access there is equivalent to root, since `update.sh` installs from it.
+
+The web app has **no** privilege to install anything. It shells out to `sudo -n systemctl start door_update{,_check}.service` and otherwise only reads the status JSON and log those units write. Everything else — fetch, merge, install, restart — happens as root inside `update.sh`.
+
+- **Auto-rollback is the point.** If `door_access` isn't active after the restart, `update.sh` resets to the previous commit, reinstalls, and restarts. A broken release must never leave the door unmanaged. Preserve this if you touch the script.
+- **`--ff-only` and a pinned remote.** It refuses a non-fast-forward (so hand-edits on the Pi fail loudly rather than being discarded) and refuses any origin but the configured URL (otherwise rewriting the remote turns the update button into arbitrary root execution).
+- **Status lives on disk, not in the request.** Applying an update restarts `door_admin`, killing the browser's connection; `updates.js` treats fetch failures during a run as "restarting" and reloads once the server returns.
+- **`install.sh` must stay non-interactive under the updater.** `grant_web_admins` tests `${DOOR_WEB_ADMINS+x}` (set, not non-empty) so the updater can pass an empty value to skip the prompt — `read` at EOF would otherwise abort the script under `set -e`.
+- **Security posture:** a `dooradmin` web session is effectively root on this box. That is documented, not accidental; `"allow_update": false` removes the page.
+
 ## Event history (`event_store.py`)
 
 SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main thread only, best-effort — a history failure must never stop the door). `EventReader` reads from the web process.
@@ -67,6 +79,9 @@ SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main threa
 | `web.json` | Web admin settings (deployed to `/etc/door_access/web.json`) — separate file so `doorweb` never needs to read the MQTT password |
 | `door_access.service` | systemd unit — runs as `door` user, auto-restart on failure |
 | `door_admin.service` | systemd unit — runs as `doorweb`, gunicorn + TLS, hardened, `SupplementaryGroups=shadow dooradmin` |
+| `update.sh` | Privileged updater — fetch, ff-only merge, reinstall, restart, auto-rollback. Run as root by the units below, never by the web app |
+| `door_update.service` / `door_update_check.service` | Oneshot root units: apply / check. Separate so "may check" and "may apply" are distinct capabilities |
+| `door-update.sudoers` | → `/etc/sudoers.d/door_update`. Lets `doorweb` start exactly those two units and nothing else |
 | `install.sh` | apt deps (incl. rpi-lgpio), venv, CCID escape, users/groups, polkit rule, local CA + TLS cert, dirs, installs files, enables both services. `DOOR_SRC_DIR=<path>` installs from a local checkout instead of GitHub |
 | `README.md` | Wiring, setup, MQTT topic reference, HA config examples |
 

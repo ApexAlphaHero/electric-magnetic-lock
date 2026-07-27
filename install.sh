@@ -17,8 +17,14 @@ LOG_FILE="$LOG_DIR/door_access.log"
 DATA_DIR="/var/lib/door_access"
 TLS_DIR="$CFG_DIR/tls"
 VENV_DIR="$APP_DIR/venv"
+REPO_DIR="$APP_DIR/repo"
+REPO_URL="https://github.com/ApexAlphaHero/electric-magnetic-lock.git"
+REPO_BRANCH="master"
 SERVICE_FILE="/etc/systemd/system/door_access.service"
 WEB_SERVICE_FILE="/etc/systemd/system/door_admin.service"
+UPDATE_SERVICE_FILE="/etc/systemd/system/door_update.service"
+UPDATE_CHECK_SERVICE_FILE="/etc/systemd/system/door_update_check.service"
+SUDOERS_FILE="/etc/sudoers.d/door_update"
 POLKIT_RULE="/etc/polkit-1/rules.d/50-door-pcsc.rules"
 CCID_PLIST="/etc/libccid_Info.plist"
 ADMIN_GROUP="dooradmin"
@@ -77,7 +83,8 @@ install_packages() {
         python3-rpi-lgpio \
         python3-venv \
         libpam0g-dev \
-        openssl
+        openssl \
+        git
 
     info "Enabling pcscd ..."
     systemctl enable pcscd
@@ -172,15 +179,19 @@ create_user() {
 }
 
 grant_web_admins() {
-    local admins="${DOOR_WEB_ADMINS:-}"
-
-    if [[ -z "$admins" ]]; then
+    local admins
+    # Testing for *set* rather than non-empty lets the updater pass
+    # DOOR_WEB_ADMINS="" to skip the prompt entirely. There is no terminal
+    # during an unattended update, and `read` at EOF would abort under `set -e`.
+    if [[ -n "${DOOR_WEB_ADMINS+x}" ]]; then
+        admins="$DOOR_WEB_ADMINS"
+    else
         echo ""
         echo "─── Web Admin Access ─────────────────────────────────────────"
         echo "  Only members of the '$ADMIN_GROUP' group can sign in to the"
         echo "  web UI, even with a valid Pi password."
         echo ""
-        read -rp "  Pi usernames to grant access (space separated, blank to skip): " admins
+        read -rp "  Pi usernames to grant access (space separated, blank to skip): " admins || admins=""
     fi
 
     for u in $admins; do
@@ -297,10 +308,10 @@ install_app_files() {
 
     info "Downloading web admin templates ..."
     for t in base.html login.html dashboard.html tags.html history.html \
-             error.html _events_table.html; do
+             updates.html error.html _events_table.html; do
         download "$APP_DIR/templates/$t" "$REPO/templates/$t"
     done
-    for s in app.css nfc.js; do
+    for s in app.css nfc.js updates.js; do
         download "$APP_DIR/static/$s" "$REPO/static/$s"
     done
 
@@ -449,6 +460,55 @@ install_service() {
     info "Services enabled (not started — edit config first)"
 }
 
+# ── 9. In-place updates from the web admin ──────────────────────────────────────
+
+install_updater() {
+    # A git checkout is what the updater fast-forwards; the running app is still
+    # the copy installed under /opt/door_access, not this checkout.
+    if [[ -d "$REPO_DIR/.git" ]]; then
+        info "Update checkout already present at $REPO_DIR"
+    else
+        info "Cloning $REPO_URL for future updates ..."
+        rm -rf "$REPO_DIR"
+        if ! git clone --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR"; then
+            warn "Clone failed — the web Updates page will not work until you run:"
+            warn "  sudo git clone --branch $REPO_BRANCH $REPO_URL $REPO_DIR"
+            return
+        fi
+    fi
+    # Root-owned and not group-writable: this checkout is the source the updater
+    # installs from, so anyone able to write here could run code as root.
+    chown -R root:root "$REPO_DIR"
+    chmod -R go-w "$REPO_DIR"
+
+    info "Installing updater ..."
+    download "$APP_DIR/update.sh" "$REPO/update.sh"
+    chown root:root "$APP_DIR/update.sh"
+    chmod 755 "$APP_DIR/update.sh"
+
+    download "$UPDATE_SERVICE_FILE"       "$REPO/door_update.service"
+    download "$UPDATE_CHECK_SERVICE_FILE" "$REPO/door_update_check.service"
+    chmod 644 "$UPDATE_SERVICE_FILE" "$UPDATE_CHECK_SERVICE_FILE"
+
+    # sudoers: validate before installing. A malformed file in sudoers.d can
+    # break sudo for every user on the machine, so it is checked in a temporary
+    # location first and only then moved into place.
+    info "Installing sudoers rule for the updater ..."
+    local tmp_sudoers
+    tmp_sudoers="$(mktemp)"
+    download "$tmp_sudoers" "$REPO/door-update.sudoers"
+    chmod 440 "$tmp_sudoers"
+    if visudo -c -f "$tmp_sudoers" >/dev/null 2>&1; then
+        install -m 440 -o root -g root "$tmp_sudoers" "$SUDOERS_FILE"
+        info "Updater sudoers rule installed"
+    else
+        warn "sudoers rule failed validation — NOT installed; the Updates page will not work"
+    fi
+    rm -f "$tmp_sudoers"
+
+    systemctl daemon-reload
+}
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 require_root
@@ -462,6 +522,7 @@ create_tls_cert
 install_app_files
 create_log_file
 install_service
+install_updater
 grant_web_admins
 
 PI_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
