@@ -1,0 +1,34 @@
+# Web admin (door_admin.service) Python dependencies — installed into
+# /opt/door_access/venv by install.sh. The door service itself uses system
+# python3 + apt packages only and is deliberately NOT covered by this file.
+#
+# Pinned exactly, transitives included, for two reasons:
+#
+#   1. Every Pi converges on the same known-good set. Before this file existed,
+#      install.sh ran an unpinned `pip install` with no --upgrade, so whatever
+#      pip resolved on the day of first install stayed there forever — a box set
+#      up on gunicorn 21.x kept it through every subsequent update.
+#   2. Dependabot can only see dependencies that appear in a manifest. Pinning
+#      the transitives too puts Werkzeug and Jinja2 under its watch, and those
+#      are where the advisories that matter here have actually landed (Werkzeug
+#      multipart DoS and safe_join traversal; Jinja2 sandbox breakouts).
+#
+# install.sh installs this with --upgrade, so merging a Dependabot PR and
+# pressing "Update" in the web admin is a complete patch path.
+
+# ── direct ─────────────────────────────────────────────────────────────────────
+Flask==3.1.3
+gunicorn==26.0.0
+python-pam==2.0.2
+# Undeclared dependency of python-pam 2.0.2: its __internals imports six, but the
+# wheel does not require it, so `import pam` fails unless six is installed.
+six==1.17.0
+
+# ── transitive (pinned so Dependabot tracks them) ──────────────────────────────
+blinker==1.9.0
+click==8.4.2
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+packaging==26.2
+Werkzeug==3.1.8

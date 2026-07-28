@@ -102,11 +102,17 @@ create_venv() {
     # The door service itself keeps using system python3 with apt packages only.
     info "Creating web admin virtualenv at $VENV_DIR ..."
     python3 -m venv "$VENV_DIR"
+
+    # requirements.txt is fetched here rather than in install_app_files because
+    # that runs later; `python3 -m venv` has already created $APP_DIR by now.
+    download "$APP_DIR/requirements.txt" "$REPO/requirements.txt"
+
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-    # 'six' is an undeclared dependency of python-pam 2.0.2 — its __internals
-    # imports it, but the wheel does not require it, so the module fails to
-    # import unless it is installed explicitly.
-    "$VENV_DIR/bin/pip" install --quiet Flask gunicorn python-pam six
+    # --upgrade matters on reinstalls: pip leaves an already-satisfied package
+    # alone, so without it a venv created years ago keeps its original Flask and
+    # gunicorn through every update. Since update.sh re-runs this script, this is
+    # the path by which a merged Dependabot bump actually reaches the door.
+    "$VENV_DIR/bin/pip" install --quiet --upgrade -r "$APP_DIR/requirements.txt"
 
     # Fail loudly here rather than at the first login attempt.
     if ! "$VENV_DIR/bin/python3" -c "import flask, pam" 2>/dev/null; then

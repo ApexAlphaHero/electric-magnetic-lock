@@ -85,6 +85,12 @@ Flask, gunicorn and python-pam, which the installer puts in a venv at
 `/opt/door_access/venv` — `python-pam` isn't reliably packaged across Debian releases, and
 PEP 668 blocks pip into the system interpreter.
 
+Those venv packages are pinned in [`requirements.txt`](requirements.txt), transitives
+included, and installed with `--upgrade`. Dependabot watches that file, so a security
+advisory becomes a PR; merging it and pressing **Update** in the web admin is what actually
+moves the version on the Pi. Without the pin the venv would keep whatever pip resolved on
+the day of first install — reinstalling leaves an already-satisfied package alone.
+
 ### One-liner install from GitHub
 
 ```bash
@@ -93,7 +99,7 @@ curl -fsSL https://raw.githubusercontent.com/ApexAlphaHero/electric-magnetic-loc
 
 The installer will:
 1. Install all system + Python packages (from apt) and enable the `pcscd` PC/SC daemon
-2. Create `/opt/door_access/venv` with the web admin's dependencies (Flask, gunicorn, python-pam)
+2. Create `/opt/door_access/venv` with the web admin's dependencies, at the versions pinned in `requirements.txt`
 3. Enable CCID escape commands in `/etc/libccid_Info.plist` (needed for the reader's LED/buzzer)
 4. Create the `door` and `doorweb` system users and the `dooradmin` admin group
 5. Install a polkit rule so the session-less `door` user can reach `pcscd`
@@ -559,6 +565,7 @@ Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough 
   control_socket.py     Unix-socket protocol between the web UI and the door service
   web_admin.py          Flask web admin (runs as 'doorweb' under door_admin.service)
   templates/  static/   Web admin pages and assets
+  requirements.txt      Pinned web admin dependencies (the venv is installed from this)
   venv/                 Web admin dependencies (Flask, gunicorn, python-pam)
 
 /etc/door_access/

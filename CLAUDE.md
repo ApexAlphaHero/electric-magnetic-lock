@@ -32,6 +32,8 @@ Event types: `NFC_UID`, `BUTTON_PRESS`, `DOOR_STATE`, `DOOR_ALERT`, `UNLOCK_TIME
 
 Flask + gunicorn (TLS), runs as `doorweb`, separate from the door service. Dependencies live in `/opt/door_access/venv` (Flask, gunicorn, python-pam) — **not** apt, because the PAM binding isn't reliably packaged and PEP 668 blocks system pip. The door service itself still uses system python3 + apt only; don't add venv deps to it.
 
+**Venv deps are pinned in `requirements.txt` and installed with `--upgrade`.** Pin transitives too (Werkzeug, Jinja2, MarkupSafe, …), not just the four direct deps: Dependabot only sees what a manifest names, and the advisories that hit this app land on Werkzeug and Jinja2. `--upgrade` is load-bearing — pip skips an already-satisfied package, so without it a venv created years ago carries its original Flask and gunicorn through every reinstall. `create_venv` downloads `requirements.txt` itself rather than waiting for `install_app_files`, which runs later.
+
 - **Auth** — PAM (`login` service) *plus* `dooradmin` group membership. Both required. Bad password and not-in-group return the identical message so the UI never confirms which accounts exist. `doorweb` is in `shadow` so pam_unix can read `/etc/shadow` directly (the setuid `unix_chkpwd` helper only lets a non-root caller check its *own* password).
 - **No shared state with the door service except the socket and the DB.** The web app cannot write `config.json` (it can't even read it — the MQTT password lives there) and has no GPIO. Every mutation is a `ControlClient.call()` over `/run/door_access/control.sock`, dispatched as `WEB_COMMAND` and executed in `_run_web_command` on the event loop.
 - **Socket authorization is filesystem permissions** — mode 0660, group `dooradmin`. There is no auth inside the protocol. `ControlSocket._grant_group_access` re-groups the socket and its systemd-created runtime dir at startup, which is why `door` must also be in `dooradmin`.
@@ -85,6 +87,8 @@ SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main threa
 | `update.sh` | Privileged updater — fetch, ff-only merge, reinstall, restart, auto-rollback. Run as root by the units below, never by the web app |
 | `door_update.service` / `door_update_check.service` | Oneshot root units: apply / check. Separate so "may check" and "may apply" are distinct capabilities |
 | `door-update.rules` | → `/etc/polkit-1/rules.d/50-door-update.rules`. Lets `doorweb` start exactly those two units and nothing else |
+| `requirements.txt` | Pinned web admin venv deps (direct + transitive). The manifest Dependabot watches; `create_venv` installs from it |
+| `.github/dependabot.yml` | Weekly pip + github-actions update checks. Repo also has Dependabot alerts and security updates enabled server-side |
 | `install.sh` | apt deps (incl. rpi-lgpio), venv, CCID escape, users/groups, polkit rule, local CA + TLS cert, dirs, installs files, enables both services. `DOOR_SRC_DIR=<path>` installs from a local checkout instead of GitHub |
 | `README.md` | Wiring, setup, MQTT topic reference, HA config examples |
 
