@@ -18,7 +18,7 @@
 
 # ── direct ─────────────────────────────────────────────────────────────────────
 Flask==3.1.3
-gunicorn==26.0.0
+gunicorn==26.1.0
 python-pam==2.0.2
 # Undeclared dependency of python-pam 2.0.2: its __internals imports six, but the
 # wheel does not require it, so `import pam` fails unless six is installed.
