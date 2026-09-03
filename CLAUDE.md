@@ -94,7 +94,7 @@ SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main threa
 
 ## Hardware
 
-- **GPIO17** — Relay HAT signal (active-low: LOW = unlocked, HIGH = locked)
+- **GPIO17** — Relay HAT signal (active-low: LOW = unlocked, HIGH = locked). The magnet is wired **COM/NC**, so a de-energized coil means *locked*: an undriven pin (reboot, crash, `GPIO.cleanup()`) leaves the door locked, not open. Fail-secure — egress depends on a REX/fire interlock cutting the 12V, not on the Pi
 - **GPIO18** — LED button illumination (HIGH = on when unlocked)
 - **GPIO27** — Button input, internal pull-up, FALLING edge = press
 - **GPIO22** — Left door sensor (NC fridge-light switch), internal pull-up, LOW = open

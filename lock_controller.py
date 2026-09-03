@@ -30,7 +30,14 @@ class LockController:
     def setup(self) -> None:
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
-        GPIO.setup(self._relay_pin, GPIO.OUT)
+        # initial= matters. Without it the pin is driven to the default LOW,
+        # which is the *unlock* level on an active-low board, for the few lines
+        # until _apply_state below. Come up at the locked level instead.
+        GPIO.setup(
+            self._relay_pin,
+            GPIO.OUT,
+            initial=GPIO.HIGH if self._active_low else GPIO.LOW,
+        )
         GPIO.setup(self._led_pin, GPIO.OUT)
         GPIO.setup(self._button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         self._apply_state("LOCKED")

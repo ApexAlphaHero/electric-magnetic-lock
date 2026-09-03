@@ -27,7 +27,7 @@ GND     (pin 6) ────────────────► GND
 5V      (pin 2) ────────────────► VCC
 
                                    COM ── 12V supply (+)
-                                   NO  ── Electromagnetic lock (+)
+                                   NC  ── Electromagnetic lock (+)
                                           Lock GND ── 12V supply (-)
 
 LED Momentary Button
@@ -57,7 +57,9 @@ ACR1552U NFC Reader
 USB port ─────────────────► Any Pi USB port (powered + data)
 ```
 
-> **Relay polarity:** The relay HAT is active-low — GPIO LOW energizes the relay coil and releases the electromagnetic lock (unlocked). GPIO HIGH de-energizes the coil and the lock engages. This is configured in `config.json` as `"active_low_relay": true`.
+> **Relay polarity and lock wiring.** The relay HAT is active-low: GPIO LOW energizes the coil, GPIO HIGH leaves it de-energized. The electromagnet is wired across **COM/NC**, so the coil sits de-energized — and the magnet powered — for the whole time the door is locked, and only pulls in for the seconds of an unlock. This is `"active_low_relay": true` in `config.json`.
+>
+> The consequence worth knowing: **anything that stops driving GPIO17 leaves the door locked.** A reboot, a crashed service, or the `GPIO.cleanup()` on shutdown all release the coil, which closes NC and keeps the magnet energized. That is fail-**secure**, not fail-safe — the door stays locked while the Pi is down, so egress has to be guaranteed by a request-to-exit device and/or a fire-alarm interlock that cuts the 12V independently of the Pi.
 
 ---
 
@@ -548,7 +550,7 @@ journalctl -u door_access -n 50 --no-pager
 ```
 
 **Relay clicks but lock doesn't engage/release**
-Verify COM/NO wiring on the relay. Check that the 12V supply can deliver enough current for the electromagnet (typically 500mA–1A).
+Verify COM/NC wiring on the relay. Check that the 12V supply can deliver enough current for the electromagnet (typically 500mA–1A).
 
 ---
 
