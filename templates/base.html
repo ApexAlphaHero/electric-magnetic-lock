@@ -13,6 +13,9 @@
   <a href="{{ url_for('dashboard') }}" class="{{ 'on' if request.endpoint == 'dashboard' }}">Status</a>
   <a href="{{ url_for('tags') }}" class="{{ 'on' if request.endpoint == 'tags' }}">Tags</a>
   <a href="{{ url_for('history_page') }}" class="{{ 'on' if request.endpoint == 'history_page' }}">History</a>
+  {% if allow_logs %}
+    <a href="{{ url_for('logs_page') }}" class="{{ 'on' if request.endpoint == 'logs_page' }}">Log</a>
+  {% endif %}
   {% if allow_update %}
     <a href="{{ url_for('updates') }}" class="{{ 'on' if request.endpoint == 'updates' }}">Updates</a>
   {% endif %}

@@ -12,7 +12,10 @@ Group=doorweb
 #             non-root caller check its *own* password.
 # dooradmin — permission to open the door service's control socket and to read
 #             the event database.
-SupplementaryGroups=shadow dooradmin
+# systemd-journal — read the journal for this application's own units, for the
+#             System log page. Read-only; journalctl is not setuid, so this is
+#             group membership doing the work and NoNewPrivileges stays on.
+SupplementaryGroups=shadow dooradmin systemd-journal
 
 WorkingDirectory=/opt/door_access
 Environment=PYTHONUNBUFFERED=1

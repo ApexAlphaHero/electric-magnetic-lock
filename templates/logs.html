@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}System log — Door Access{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>System log</h2>
+  <p class="muted small">
+    The journal for this application's own services.
+    <a href="{{ url_for('history_page') }}">History</a> records what the door did;
+    this records what the software underneath it did — services starting and crashing,
+    PC/SC and reader errors, MQTT reconnects, and what the updater ran.
+  </p>
+
+  <form method="get" action="{{ url_for('logs_page') }}" class="filters">
+    <label for="unit" class="sr">Service</label>
+    <select id="unit" name="unit">
+      <option value="">All services</option>
+      {% for u in units %}
+        <option value="{{ u }}" {{ 'selected' if u == unit }}>
+          {{ u|replace('.service', '') }}
+        </option>
+      {% endfor %}
+    </select>
+
+    <label for="priority" class="sr">Minimum severity</label>
+    <select id="priority" name="priority">
+      <option value="">All levels</option>
+      <option value="3" {{ 'selected' if priority == 3 }}>Errors only</option>
+      <option value="4" {{ 'selected' if priority == 4 }}>Warnings and above</option>
+      <option value="6" {{ 'selected' if priority == 6 }}>Info and above</option>
+    </select>
+
+    <label for="q" class="sr">Search</label>
+    <input id="q" name="q" value="{{ query }}" placeholder="Search messages" maxlength="64">
+
+    <button type="submit">Filter</button>
+    {% if unit or priority is not none or query %}
+      <a class="button" href="{{ url_for('logs_page') }}">Clear</a>
+    {% endif %}
+  </form>
+
+  {% if error %}
+    <p class="muted">{{ error }}</p>
+  {% elif not entries %}
+    <p class="muted">Nothing in the journal matches.</p>
+  {% else %}
+    <p class="muted small">
+      {{ entries|length }} entr{{ 'y' if entries|length == 1 else 'ies' }}, newest first.
+      <span id="log-updated" role="status" aria-live="polite"></span>
+    </p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Service</th><th>Level</th><th>Message</th></tr>
+        </thead>
+        <tbody id="log-body" data-endpoint="{{ url_for('logs_data') }}">
+          {% for e in entries %}
+            <tr>
+              <td class="mono nowrap">{{ e.time }}</td>
+              <td class="nowrap">{{ e.unit|replace('.service', '') }}</td>
+              <td><span class="tag lvl-{{ e.level }}">{{ e.level }}</span></td>
+              <td class="logmsg">{{ e.message }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+
+{% if not persistent %}
+<div class="card warn">
+  <h2>This journal is volatile</h2>
+  <p class="muted small">
+    <code>/var/log/journal</code> does not exist, so systemd is keeping the journal in RAM
+    and <strong>everything on this page is lost on reboot</strong> — including whatever was
+    logged by the fault that caused the reboot. To keep it:
+  </p>
+  <pre class="log">sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald</pre>
+  <p class="muted small">
+    That moves the journal onto the SD card, so weigh it against card wear and set
+    <code>SystemMaxUse=</code> in <code>/etc/systemd/journald.conf</code> to bound it.
+  </p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='logs.js') }}"></script>
+{% endblock %}

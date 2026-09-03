@@ -365,6 +365,35 @@ paginated under **History**. Retention defaults to 90 days
 The history starts from the moment you install this version — earlier activity only
 exists in `door_access.log` and is not backfilled.
 
+### System log
+
+**History** records what the door did. **Log** records what the software underneath it did,
+by reading journald for this application's own units — the failures that never become door
+events:
+
+| Unit | What it tells you |
+|------|-------------------|
+| `door_access` | Reader disconnects, GPIO errors, MQTT reconnects, crashes and restarts |
+| `door_admin` | Login attempts, gunicorn errors, TLS problems |
+| `door_update` / `door_update_check` | What the updater fetched, installed, or rolled back |
+| `pcscd` | PC/SC daemon faults — the usual cause of "the reader stopped working" |
+
+Filter by service, minimum severity, and a substring; the table refreshes every 10 seconds.
+The unit list is a **whitelist** in `web.json` — nothing typed into the URL is ever passed
+to `journalctl`, only matched against that list. Set `"allow_logs": false` to remove the
+page entirely.
+
+Reading the journal needs the `doorweb` account in the `systemd-journal` group, which
+`install.sh` arranges and `door_admin.service` declares. If the page says it is not allowed
+to read the journal, re-run the installer and `sudo systemctl restart door_admin`.
+
+> **The journal is volatile by default.** Unless `/var/log/journal` exists, systemd keeps
+> logs in RAM and everything on this page is lost on reboot — including whatever was logged
+> by the fault that *caused* the reboot. The page warns you when this is the case. To make it
+> persistent: `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`,
+> and bound it with `SystemMaxUse=` in `/etc/systemd/journald.conf` so it does not chew
+> through the SD card.
+
 ### How the two services are separated
 
 The web app runs as its own user (`doorweb`) and holds **no** GPIO access and **no** write
@@ -566,13 +595,13 @@ Verify COM/NC wiring on the relay. Check that the 12V supply can deliver enough 
   event_store.py        SQLite event history (writer for the door service, reader for the web UI)
   control_socket.py     Unix-socket protocol between the web UI and the door service
   web_admin.py          Flask web admin (runs as 'doorweb' under door_admin.service)
-  templates/  static/   Web admin pages and assets
+  templates/  static/   Web admin pages and assets (logs.html + logs.js = System log)
   requirements.txt      Pinned web admin dependencies (the venv is installed from this)
   venv/                 Web admin dependencies (Flask, gunicorn, python-pam)
 
 /etc/door_access/
   config.json           Door service configuration (door-owned; holds the MQTT password)
-  web.json              Web admin settings (admin group, session length, unlock toggle)
+  web.json              Web admin settings (admin group, session length, unlock + log toggles)
   web.env               Web admin listen address (gunicorn --bind)
   web_secret            Session signing key (doorweb-owned, 0600)
   tls/                  ca.pem, cert.pem, key.pem for the web admin

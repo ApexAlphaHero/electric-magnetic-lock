@@ -177,6 +177,20 @@ tr.denied td { background: rgba(185, 28, 28, 0.06); }
 .tag.t-tag_removed, .tag.t-door_open_too_long { color: var(--danger); }
 .tag.t-web_unlock, .tag.t-button_unlock { color: var(--open); }
 
+/* syslog severities, on the same pill as the event tags */
+.tag.lvl-emerg, .tag.lvl-alert, .tag.lvl-crit, .tag.lvl-err { color: var(--danger); }
+.tag.lvl-warning { color: var(--open); }
+.tag.lvl-debug { color: var(--muted); }
+
+/* Journal text: preserve the sender's line breaks, but never let a long token
+   push the table wider than the phone screen it is being read on. */
+.logmsg {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .pager { display: flex; gap: 0.5rem; margin-top: 1rem; }
 
 /* ── misc ────────────────────────────────────────────────────────────────── */

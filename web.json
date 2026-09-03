@@ -14,6 +14,17 @@
   "_tls_ca": "Public CA certificate, served unauthenticated at /ca.crt so a device can be taught to trust this site. The signing key (ca-key.pem) is never served.",
   "tls_ca": "/etc/door_access/tls/ca.pem",
 
+  "_allow_logs": "Set false to remove the System log page. It exposes journald output for the units below, which is read-only but does reveal usernames and internal errors.",
+  "allow_logs": true,
+  "log_units": [
+    "door_access.service",
+    "door_admin.service",
+    "door_update.service",
+    "door_update_check.service",
+    "pcscd.service"
+  ],
+  "log_lines": 300,
+
   "_allow_update": "Set false to remove the Updates page entirely. Applying an update runs code from the git remote as root on this machine, so turn it off if anyone other than you can reach a dooradmin account.",
   "allow_update": true,
   "update_status": "/var/lib/door_access/update-status.json",

@@ -183,6 +183,15 @@ create_user() {
     # control socket and the event database.
     usermod -aG shadow       "$WEB_USER"
     usermod -aG "$ADMIN_GROUP" "$WEB_USER"
+    # Lets the System log page read the journal for this application's units.
+    # Read-only, and web_admin.py only ever passes units from its own whitelist.
+    # Guarded: an unguarded usermod against a missing group would abort the whole
+    # install under `set -e`, and the log page is not worth failing a deploy for.
+    if getent group systemd-journal &>/dev/null; then
+        usermod -aG systemd-journal "$WEB_USER"
+    else
+        warn "No systemd-journal group — the web admin's System log page will be empty"
+    fi
 }
 
 grant_web_admins() {
@@ -315,10 +324,10 @@ install_app_files() {
 
     info "Downloading web admin templates ..."
     for t in base.html login.html dashboard.html tags.html history.html \
-             updates.html error.html _events_table.html; do
+             updates.html logs.html error.html _events_table.html; do
         download "$APP_DIR/templates/$t" "$REPO/templates/$t"
     done
-    for s in app.css nfc.js updates.js; do
+    for s in app.css nfc.js updates.js logs.js; do
         download "$APP_DIR/static/$s" "$REPO/static/$s"
     done
 

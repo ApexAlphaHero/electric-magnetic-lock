@@ -42,6 +42,7 @@ Flask + gunicorn (TLS), runs as `doorweb`, separate from the door service. Depen
 - **CSP is `'self'` with no inline scripts or styles**, so no `onclick` attributes — destructive buttons use `data-confirm`, wired up in `static/nfc.js`.
 - **The Pi's own reader is the primary enrollment path, not the phone.** "Scan at the door reader" arms the ACR1552 via `arm_enroll`; `_capture_tag` in `main.py` adds the tag and the arm is one-shot with a 60 s window, expired by the sweep in `run_event_loop` so the reader's LED stops signalling enroll the moment it lapses. An armed scan does **not** unlock. `enroll_status` hands the result over exactly once — the operator is at the door, not the browser, so the outcome must survive until polled, but must not replay.
 - **Web NFC is progressive enhancement only, and usually unavailable.** Chromium-on-Android + trusted secure context. **Firefox has no Web NFC on any platform and no iOS browser does** — this is the user's own browser, so never present phone scanning as the default or assume it will work. The button stays hidden unless `NDEFReader` exists; the fallback text distinguishes "certificate not trusted" from "wrong browser" so nobody is sent to install a CA that won't help them.
+- **The System log page reads journald through a whitelist.** `log_units` in `web.json` is the *only* source of unit names reaching `journalctl`'s argv — a unit from the query string is matched against it, never passed through. Access comes from `SupplementaryGroups=systemd-journal` on the unit (journalctl is not setuid, so `NoNewPrivileges` stays on). `read_journal` returns `(entries, error)` rather than raising, because a log page that cannot read the journal must still render and say why. Messages arrive as arbitrary bytes from other processes: `logs.js` writes them with `textContent`, never `innerHTML`.
 - **`/ca.crt` is intentionally unauthenticated.** You need the CA *before* the connection is trustworthy; gating it behind login would mean sending a password over an unverified connection. It serves the public CA cert only — `ca-key.pem` is never exposed. Sent as `.crt` with `application/x-x509-ca-cert` because Android's certificate installer filters the picker by extension and skips `.pem`.
 
 ## In-place updates
@@ -79,7 +80,7 @@ SQLite at `/var/lib/door_access/events.db`, WAL. `EventStore` writes (main threa
 | `event_store.py` | `EventStore` (writer, door service) / `EventReader` (reader, web) — SQLite event history |
 | `control_socket.py` | `ControlSocket` (server, door service) / `ControlClient` (web); `normalize_uid` shared by both |
 | `web_admin.py` | Flask web admin — PAM login, `dooradmin` gating, CSRF, login throttle, tags + history + unlock |
-| `templates/`, `static/` | Web admin pages; `static/nfc.js` holds the optional Web NFC scan |
+| `templates/`, `static/` | Web admin pages; `static/nfc.js` holds the optional Web NFC scan, `static/logs.js` the System log auto-refresh |
 | `config.json` | Door service settings (deployed to `/etc/door_access/config.json` on Pi) |
 | `web.json` | Web admin settings (deployed to `/etc/door_access/web.json`) — separate file so `doorweb` never needs to read the MQTT password |
 | `door_access.service` | systemd unit — runs as `door` user, auto-restart on failure |
@@ -111,7 +112,7 @@ Two doors, **one shared lock** (single relay on GPIO17). Door sensors are config
 - Control socket: `/run/door_access/control.sock` (0660, group `dooradmin`)
 - Log: `/var/log/door_access/door_access.log` (door-owned dir so rotation works; daily rotation, 7 days)
 - Services: `/etc/systemd/system/door_access.service`, `door_admin.service`
-- Service users: `door` (groups: gpio, plugdev, spi, dooradmin), `doorweb` (groups: shadow, dooradmin)
+- Service users: `door` (groups: gpio, plugdev, spi, dooradmin), `doorweb` (groups: shadow, dooradmin, systemd-journal)
 - Admin group: `dooradmin` — the web UI's access control; `usermod -aG dooradmin <user>` to grant
 
 ## MQTT Topics

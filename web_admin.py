@@ -51,6 +51,18 @@ DEFAULTS = {
     "page_size": 50,
     "max_login_attempts": 5,
     "lockout_minutes": 15,
+    # Which units the System log page may read. A whitelist, not a filter:
+    # nothing from the query string ever reaches journalctl's argv, it is
+    # only matched against this list.
+    "allow_logs": True,
+    "log_units": [
+        "door_access.service",
+        "door_admin.service",
+        "door_update.service",
+        "door_update_check.service",
+        "pcscd.service",
+    ],
+    "log_lines": 300,
 }
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
@@ -182,6 +194,89 @@ class LoginThrottle:
             self._failures.pop(key, None)
 
 
+# ── system log ──────────────────────────────────────────────────────────────────
+
+SYSLOG_LEVELS = {
+    0: "emerg", 1: "alert", 2: "crit", 3: "err",
+    4: "warning", 5: "notice", 6: "info", 7: "debug",
+}
+
+
+def _journal_message(raw) -> str:
+    """Render MESSAGE, which journald hands back as a list of byte values when
+    the line is not valid UTF-8 — a device name with a stray byte, say.
+    Decoding those rather than skipping them matters: the malformed output is
+    usually the part worth reading.
+    """
+    if isinstance(raw, list):
+        return bytes(b & 0xFF for b in raw).decode("utf-8", "replace")
+    return "" if raw is None else str(raw)
+
+
+def read_journal(units: list[str], lines: int = 300,
+                 priority: int | None = None) -> tuple[list[dict], str | None]:
+    """Recent journald entries for `units`, newest first.
+
+    Returns (entries, error) instead of raising — a log page that cannot reach
+    the journal should still render and explain why. `units` becomes argv, so
+    callers must pass values drawn from the configured whitelist.
+    """
+    if not units:
+        return [], None
+    cmd = ["journalctl", "--output=json", "--no-pager", f"--lines={int(lines)}"]
+    for unit in units:
+        cmd += ["-u", unit]
+    if priority is not None:
+        cmd.append(f"--priority={int(priority)}")
+
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return [], "journalctl is not installed on this system."
+    except subprocess.TimeoutExpired:
+        return [], "journalctl did not respond within 15s."
+    except OSError as e:
+        return [], str(e)
+
+    if done.returncode != 0:
+        detail = (done.stderr or "").strip()[:300]
+        if "permission" in detail.lower() or "not permitted" in detail.lower():
+            return [], ("Not allowed to read the journal. The doorweb account must be "
+                        "in the systemd-journal group — re-run install.sh, then "
+                        "'sudo systemctl restart door_admin'.")
+        return [], detail or "journalctl failed."
+
+    entries = []
+    for line in done.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        try:
+            stamp = int(record.get("__REALTIME_TIMESTAMP", 0)) / 1_000_000
+        except (TypeError, ValueError):
+            stamp = 0
+        try:
+            priority_value = int(record.get("PRIORITY", 6))
+        except (TypeError, ValueError):
+            priority_value = 6
+        entries.append({
+            "time": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+                     if stamp else ""),
+            "unit": record.get("_SYSTEMD_UNIT") or record.get("SYSLOG_IDENTIFIER") or "",
+            "priority": priority_value,
+            "level": SYSLOG_LEVELS.get(priority_value, str(priority_value)),
+            "message": _journal_message(record.get("MESSAGE")),
+        })
+
+    # journalctl --lines returns oldest-first; History is newest-first and these
+    # two pages should not disagree about which way time runs.
+    entries.reverse()
+    return entries, None
+
+
 # ── app ─────────────────────────────────────────────────────────────────────────
 
 def create_app(cfg: dict | None = None) -> Flask:
@@ -237,6 +332,7 @@ def create_app(cfg: dict | None = None) -> Flask:
             "user": current_user(),
             "allow_unlock": bool(cfg["allow_unlock"]),
             "allow_update": bool(cfg["allow_update"]),
+            "allow_logs": bool(cfg["allow_logs"]),
         }
 
     @app.after_request
@@ -599,6 +695,61 @@ def create_app(cfg: dict | None = None) -> Flask:
         audit("UPDATE_APPLY", f"to {target}, from {status.get('current', {}).get('sha', '?')}")
         logger.warning("Update applied by %s", current_user())
         return jsonify(start_unit("door_update.service"))
+
+    # ── system log ─────────────────────────────────────────────────────────────
+    # A read-only window onto journald for this application's own units: the
+    # things the History page structurally cannot show, because they happen
+    # underneath it — service starts and crashes, PC/SC and reader errors,
+    # MQTT reconnects, and what the updater actually did.
+
+    def logs_enabled() -> bool:
+        return bool(cfg["allow_logs"])
+
+    def _log_query() -> dict:
+        units = [str(u) for u in cfg["log_units"]]
+        # Whitelist membership, not sanitising: an unrecognised unit falls back
+        # to all of them rather than being passed through to journalctl.
+        selected = request.args.get("unit", "")
+        wanted = [selected] if selected in units else units
+
+        try:
+            priority = int(request.args.get("priority", ""))
+        except ValueError:
+            priority = None
+        else:
+            if not 0 <= priority <= 7:
+                priority = None
+
+        query = request.args.get("q", "").strip()[:64]
+        entries, error = read_journal(wanted, int(cfg["log_lines"]), priority)
+        if query:
+            needle = query.lower()
+            entries = [e for e in entries
+                       if needle in e["message"].lower() or needle in e["unit"].lower()]
+
+        return {"units": units, "unit": selected, "priority": priority,
+                "query": query, "entries": entries, "error": error}
+
+    @app.route("/logs")
+    @login_required
+    def logs_page():
+        if not logs_enabled():
+            abort(403)
+        return render_template(
+            "logs.html",
+            # journald's Storage=auto keeps the journal in /run unless this
+            # directory exists, in which case every entry here dies on reboot.
+            persistent=os.path.isdir("/var/log/journal"),
+            **_log_query(),
+        )
+
+    @app.route("/logs/data")
+    @login_required
+    def logs_data():
+        if not logs_enabled():
+            abort(403)
+        result = _log_query()
+        return jsonify({"entries": result["entries"], "error": result["error"]})
 
     @app.errorhandler(400)
     def bad_request(e):
