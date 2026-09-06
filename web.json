@@ -4,6 +4,10 @@
   "admin_group": "dooradmin",
   "session_minutes": 60,
   "allow_unlock": true,
+
+  "_allow_hardware_config": "Set false to remove the Hardware page (NO/NC polarity for the lock relay and door sensors). Misconfiguring these doesn't affect fail-secure behavior on total power loss (the magnet is always wired COM/NC), but does invert the lock/sensor readings while the Pi is running.",
+  "allow_hardware_config": true,
+
   "max_login_attempts": 5,
   "lockout_minutes": 15,
   "page_size": 50,

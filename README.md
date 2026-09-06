@@ -282,6 +282,27 @@ button, and the web unlock button — takes effect on the next unlock, and persi
 `config.json`, so it survives a restart. Changes are recorded in the event history against
 your username. An unlock already counting down keeps its original timer.
 
+### Hardware wiring (NO/NC)
+
+The **Hardware** page exposes the same polarity settings that live in `config.json`
+under `lock.active_low_relay` and `doors[].active_low`, so they can be changed without
+editing the file and restarting the service:
+
+- **Lock relay** — which GPIO level (`active_low` / `active_high`) energizes the relay
+  module's coil. This depends on the relay board you wired in, not on the lock. The
+  electromagnet is wired across the relay's **COM/NC** contacts regardless of this
+  setting, so a total power loss still fails locked either way — get this wrong and the
+  door unlocks and relocks backwards *while the Pi is running*, it doesn't change what
+  happens if the Pi loses power.
+- **Each door sensor** — whether its reed switch is wired **normally closed (NC)**, the
+  default (`LOW` = open), or **normally open (NO)** (`HIGH` = open).
+
+Changes take effect immediately (no restart) and persist to `config.json`. The current
+door/lock state is re-read under the new polarity right away, so an open-too-long alert
+or a stale `OPEN`/`CLOSED` reading doesn't linger after a fix. Every change is recorded
+in the event history against your username. Set `"allow_hardware_config": false` in
+`/etc/door_access/web.json` to remove this page.
+
 ### Adding a tag
 
 All on the **Tags** page. Type a name first — a blank name becomes `Tag <last 4>`.

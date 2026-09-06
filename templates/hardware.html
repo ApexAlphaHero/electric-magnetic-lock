@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Hardware — Door Access{% endblock %}
+
+{% block content %}
+{% if error %}
+  <div class="card warn">
+    <strong>Door service unreachable.</strong>
+    <p class="muted">{{ error }}</p>
+  </div>
+{% else %}
+
+<div class="card">
+  <h2>Lock relay</h2>
+  <p class="muted small">
+    Which GPIO level energizes the relay module's coil — this matches the relay board
+    you wired in, not the lock. The electromagnet is wired across the relay's COM/NC
+    contacts regardless of this setting, so a total power loss still fails locked either
+    way; getting this wrong just means the door unlocks and relocks backwards while the
+    Pi is running.
+  </p>
+  <form method="post" action="{{ url_for('set_lock_polarity') }}" class="radiogroup">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="radio">
+      <input type="radio" name="polarity" value="active_low" {{ 'checked' if hw.lock.active_low }}>
+      Active-low relay — GPIO LOW energizes the coil (default)
+    </label>
+    <label class="radio">
+      <input type="radio" name="polarity" value="active_high" {{ 'checked' if not hw.lock.active_low }}>
+      Active-high relay — GPIO HIGH energizes the coil
+    </label>
+    <button type="submit" class="primary"
+            data-confirm="Change the lock relay's trigger polarity? The relay is re-driven immediately under the new mapping — the door's locked/unlocked state itself will not change.">
+      Save
+    </button>
+  </form>
+</div>
+
+{% for d in hw.doors %}
+<div class="card">
+  <h2>Door sensor: {{ d.name }}</h2>
+  <p class="muted small">
+    Whether this reed switch reports "open" on a LOW or HIGH signal — matches how the
+    switch itself is wired, independent of the lock relay above.
+  </p>
+  <form method="post" action="{{ url_for('set_door_polarity') }}" class="radiogroup">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="door" value="{{ d.name }}">
+    <label class="radio">
+      <input type="radio" name="polarity" value="nc" {{ 'checked' if d.active_low }}>
+      Normally closed (NC) — LOW = open (default)
+    </label>
+    <label class="radio">
+      <input type="radio" name="polarity" value="no" {{ 'checked' if not d.active_low }}>
+      Normally open (NO) — HIGH = open
+    </label>
+    <button type="submit" class="primary"
+            data-confirm="Change '{{ d.name }}' sensor wiring? Get this backwards and its open/closed state — and open-too-long alerts — will read inverted until corrected.">
+      Save
+    </button>
+  </form>
+</div>
+{% endfor %}
+
+{% if not hw.doors %}
+  <div class="card">
+    <p class="muted">No door sensors are configured.</p>
+  </div>
+{% endif %}
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='nfc.js') }}"></script>
+{% endblock %}

@@ -87,6 +87,15 @@ class LockController:
         if self._state_change_callback:
             self._state_change_callback("UNLOCKED")
 
+    def set_active_low(self, active_low: bool) -> None:
+        """Change relay trigger polarity (which GPIO level energizes the relay
+        coil) to match the board actually wired in. Re-applies the *current*
+        logical state under the new mapping so the door's locked/unlocked
+        state does not change as a side effect — only the signal driving it."""
+        with self._state_lock:
+            self._active_low = active_low
+            self._apply_state(self._state)
+
     def set_default_duration(self, seconds: float) -> None:
         """Update the auto-relock duration used by unlock() when no explicit
         duration is given. Set from the web admin; takes effect on the next

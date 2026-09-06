@@ -24,6 +24,28 @@ class DoorSensor:
         self._alert_sent: bool = False
         self._alert_thread: threading.Thread | None = None
 
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def get_state(self) -> str:
+        with self._state_lock:
+            return self._state
+
+    def set_active_low(self, active_low: bool) -> str:
+        """Change NO/NC wiring polarity and re-derive state from the live GPIO
+        level under the new interpretation, since the same voltage now means
+        the opposite thing. Returns the resulting state so the caller (the web
+        command handler) can republish it if it changed."""
+        with self._state_lock:
+            self._active_low = active_low
+            new_state = self._read_state()
+            if new_state != self._state:
+                self._state = new_state
+                self._door_open_since = time.monotonic() if new_state == "OPEN" else None
+                self._alert_sent = False
+            return self._state
+
     def setup(self) -> None:
         GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         initial = self._read_state()

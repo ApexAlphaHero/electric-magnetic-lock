@@ -42,6 +42,7 @@ DEFAULTS = {
     "admin_group": "dooradmin",
     "session_minutes": 60,
     "allow_unlock": True,
+    "allow_hardware_config": True,
     "control_socket": DEFAULT_SOCKET_PATH,
     "event_db": DEFAULT_DB_PATH,
     "tls_ca": "/etc/door_access/tls/ca.pem",
@@ -331,6 +332,7 @@ def create_app(cfg: dict | None = None) -> Flask:
             "csrf": csrf_token(),
             "user": current_user(),
             "allow_unlock": bool(cfg["allow_unlock"]),
+            "allow_hardware_config": bool(cfg["allow_hardware_config"]),
             "allow_update": bool(cfg["allow_update"]),
             "allow_logs": bool(cfg["allow_logs"]),
         }
@@ -502,6 +504,54 @@ def create_app(cfg: dict | None = None) -> Flask:
               else f"Could not set duration: {result.get('error')}",
               "success" if result.get("ok") else "error")
         return redirect(url_for("dashboard"))
+
+    # ── hardware wiring ────────────────────────────────────────────────────────
+    # NO/NC polarity for the lock relay and each door sensor. This changes how
+    # a GPIO level is interpreted (or driven), not the physical wiring itself —
+    # see hardware.html for the distinction spelled out for the operator.
+
+    def hardware_enabled() -> bool:
+        return bool(cfg["allow_hardware_config"])
+
+    @app.route("/hardware")
+    @login_required
+    def hardware():
+        if not hardware_enabled():
+            abort(404)
+        result = door.call("hardware_config")
+        return render_template(
+            "hardware.html",
+            hw=result.get("result") if result.get("ok") else None,
+            error=None if result.get("ok") else result.get("error"),
+        )
+
+    @app.route("/hardware/lock", methods=["POST"])
+    @login_required
+    def set_lock_polarity():
+        require_csrf()
+        if not hardware_enabled():
+            abort(404)
+        active_low = request.form.get("polarity") == "active_low"
+        result = door.call("set_lock_polarity", active_low=active_low, actor=current_user())
+        flash("Lock relay polarity updated." if result.get("ok")
+              else f"Could not update relay polarity: {result.get('error')}",
+              "success" if result.get("ok") else "error")
+        return redirect(url_for("hardware"))
+
+    @app.route("/hardware/door", methods=["POST"])
+    @login_required
+    def set_door_polarity():
+        require_csrf()
+        if not hardware_enabled():
+            abort(404)
+        name = request.form.get("door", "")
+        active_low = request.form.get("polarity") == "nc"
+        result = door.call("set_door_polarity", door=name, active_low=active_low,
+                           actor=current_user())
+        flash(f"'{name}' sensor polarity updated." if result.get("ok")
+              else f"Could not update '{name}' sensor: {result.get('error')}",
+              "success" if result.get("ok") else "error")
+        return redirect(url_for("hardware"))
 
     @app.route("/tags")
     @login_required

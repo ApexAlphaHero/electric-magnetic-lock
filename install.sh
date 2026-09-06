@@ -324,7 +324,7 @@ install_app_files() {
 
     info "Downloading web admin templates ..."
     for t in base.html login.html dashboard.html tags.html history.html \
-             updates.html logs.html error.html _events_table.html; do
+             updates.html logs.html hardware.html error.html _events_table.html; do
         download "$APP_DIR/templates/$t" "$REPO/templates/$t"
     done
     for s in app.css nfc.js updates.js logs.js; do

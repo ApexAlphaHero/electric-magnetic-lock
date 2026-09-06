@@ -207,7 +207,7 @@ def _handle_door_alert(event: dict, mqtt: MQTTHandler, events: EventStore,
 
 def _handle_web_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
                         config: dict, events: EventStore, runtime: dict,
-                        logger: logging.Logger) -> None:
+                        door_sensors: list[DoorSensor], logger: logging.Logger) -> None:
     request = event.get("request", {})
     reply: queue.Queue = event["reply"]
     cmd = request.get("cmd", "")
@@ -215,7 +215,7 @@ def _handle_web_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandle
 
     try:
         response = _run_web_command(cmd, request, actor, lock_ctrl, mqtt, config,
-                                    events, runtime, logger)
+                                    events, runtime, door_sensors, logger)
     except Exception as e:
         logger.exception("Web command %r failed", cmd)
         response = {"ok": False, "error": str(e)}
@@ -228,7 +228,8 @@ def _handle_web_command(event: dict, lock_ctrl: LockController, mqtt: MQTTHandle
 
 def _run_web_command(cmd: str, request: dict, actor: str, lock_ctrl: LockController,
                      mqtt: MQTTHandler, config: dict, events: EventStore,
-                     runtime: dict, logger: logging.Logger) -> dict:
+                     runtime: dict, door_sensors: list[DoorSensor],
+                     logger: logging.Logger) -> dict:
     authorized = config["authorized_uids"]
 
     if cmd == "arm_enroll":
@@ -264,6 +265,13 @@ def _run_web_command(cmd: str, request: dict, actor: str, lock_ctrl: LockControl
             "unlock_duration": config["lock"]["unlock_duration_seconds"],
             "doors": [d["name"] for d in config.get("doors", [])],
             "tag_count": len(authorized),
+        }}
+
+    if cmd == "hardware_config":
+        return {"ok": True, "result": {
+            "lock": {"active_low": config["lock"]["active_low_relay"]},
+            "doors": [{"name": d["name"], "active_low": d.get("active_low", True)}
+                      for d in config.get("doors", [])],
         }}
 
     if cmd == "list_tags":
@@ -303,6 +311,49 @@ def _run_web_command(cmd: str, request: dict, actor: str, lock_ctrl: LockControl
         events.log("SET_UNLOCK_DURATION", actor=actor, detail=f"{seconds:.0f}s (was {previous:.0f}s)")
         logger.info("Unlock duration set to %.0fs by %s", seconds, actor)
         return {"ok": True, "result": {"unlock_duration": seconds}}
+
+    if cmd == "set_lock_polarity":
+        active_low = request.get("active_low")
+        if not isinstance(active_low, bool):
+            return {"ok": False, "error": "active_low must be true or false"}
+        previous = config["lock"]["active_low_relay"]
+        if active_low == previous:
+            return {"ok": True, "result": {"active_low": active_low, "changed": False}}
+        config["lock"]["active_low_relay"] = active_low
+        if not _persist(config, logger):
+            config["lock"]["active_low_relay"] = previous
+            return {"ok": False, "error": "could not write config — relay polarity unchanged"}
+        lock_ctrl.set_active_low(active_low)
+        events.log("SET_LOCK_POLARITY", actor=actor,
+                  detail=f"active_low={active_low} (was {previous})")
+        logger.warning("Lock relay polarity changed to active_low=%s by %s", active_low, actor)
+        return {"ok": True, "result": {"active_low": active_low, "changed": True}}
+
+    if cmd == "set_door_polarity":
+        name = str(request.get("door", ""))
+        active_low = request.get("active_low")
+        if not isinstance(active_low, bool):
+            return {"ok": False, "error": "active_low must be true or false"}
+        sensor = next((d for d in door_sensors if d.name == name), None)
+        entry = next((d for d in config.get("doors", []) if d["name"] == name), None)
+        if sensor is None or entry is None:
+            return {"ok": False, "error": f"no such door {name!r}"}
+        previous = entry.get("active_low", True)
+        if active_low == previous:
+            return {"ok": True, "result": {"door": name, "active_low": active_low, "changed": False}}
+        entry["active_low"] = active_low
+        if not _persist(config, logger):
+            entry["active_low"] = previous
+            return {"ok": False, "error": "could not write config — sensor polarity unchanged"}
+        new_state = sensor.set_active_low(active_low)
+        mqtt.publish_door_state(name, new_state)
+        events.log("DOOR_STATE", door=name, detail=new_state)
+        events.log("SET_DOOR_POLARITY", actor=actor, door=name,
+                  detail=f"active_low={active_low} (was {previous})")
+        logger.info("Door '%s' sensor polarity changed to active_low=%s by %s (state=%s)",
+                   name, active_low, actor, new_state)
+        return {"ok": True, "result": {"door": name, "active_low": active_low,
+                                       "changed": True, "state": new_state}}
 
     if cmd == "add_tag":
         uid = normalize_uid(str(request.get("uid", "")))
@@ -372,7 +423,7 @@ def _persist(config: dict, logger: logging.Logger) -> bool:
 
 def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
                    config: dict, events: EventStore, runtime: dict,
-                   logger: logging.Logger) -> None:
+                   door_sensors: list[DoorSensor], logger: logging.Logger) -> None:
     etype = event["type"]
     if etype == "NFC_UID":
         _handle_nfc(event, lock_ctrl, mqtt, config, events, runtime, logger)
@@ -383,7 +434,7 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
     elif etype == "DOOR_ALERT":
         _handle_door_alert(event, mqtt, events, logger)
     elif etype == "WEB_COMMAND":
-        _handle_web_command(event, lock_ctrl, mqtt, config, events, runtime, logger)
+        _handle_web_command(event, lock_ctrl, mqtt, config, events, runtime, door_sensors, logger)
     elif etype == "UNLOCK_TIMER_EXPIRED":
         lock_ctrl.lock()
         mqtt.publish_lock_state("LOCKED")
@@ -395,7 +446,7 @@ def dispatch_event(event: dict, lock_ctrl: LockController, mqtt: MQTTHandler,
 def run_event_loop(event_queue: queue.Queue, shutdown_event: threading.Event,
                    lock_ctrl: LockController, mqtt: MQTTHandler,
                    config: dict, events: EventStore, runtime: dict,
-                   logger: logging.Logger) -> None:
+                   door_sensors: list[DoorSensor], logger: logging.Logger) -> None:
     logger.info("Event loop started")
     last_prune = time.monotonic()
     while not shutdown_event.is_set():
@@ -411,7 +462,7 @@ def run_event_loop(event_queue: queue.Queue, shutdown_event: threading.Event,
             logger.info("Enrollment window expired without a scan")
         try:
             event = event_queue.get(timeout=1.0)
-            dispatch_event(event, lock_ctrl, mqtt, config, events, runtime, logger)
+            dispatch_event(event, lock_ctrl, mqtt, config, events, runtime, door_sensors, logger)
         except queue.Empty:
             continue
         except Exception:
@@ -490,7 +541,7 @@ def main() -> None:
                 # The web admin is an add-on; the door must still work without it.
                 logger.error("Control socket unavailable (%s) — web admin disabled", e)
         run_event_loop(event_queue, shutdown_event, lock_ctrl, mqtt_handler,
-                       config, events, runtime, logger)
+                       config, events, runtime, door_sensors, logger)
     finally:
         logger.info("Shutdown initiated")
         control.stop()
