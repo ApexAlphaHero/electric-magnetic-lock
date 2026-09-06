@@ -14,6 +14,7 @@ unlock lives here rather than in HA.
 Served over TLS by gunicorn; see door_admin.service.
 """
 
+import datetime
 import functools
 import grp
 import json
@@ -278,6 +279,19 @@ def read_journal(units: list[str], lines: int = 300,
     return entries, None
 
 
+def _local_ts(ts: str) -> str:
+    """Render a stored UTC ISO timestamp (event_store.utcnow()) in the server's
+    own local timezone. This runs as door_admin on the Pi itself, so its local
+    timezone is the Pi's — matching what an operator standing at the door
+    expects, rather than the UTC the history is written in.
+    """
+    try:
+        return (datetime.datetime.fromisoformat(ts)
+                .astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return ts
+
+
 # ── app ─────────────────────────────────────────────────────────────────────────
 
 def create_app(cfg: dict | None = None) -> Flask:
@@ -293,6 +307,8 @@ def create_app(cfg: dict | None = None) -> Flask:
         PERMANENT_SESSION_LIFETIME=int(cfg["session_minutes"]) * 60,
         MAX_CONTENT_LENGTH=64 * 1024,
     )
+
+    app.jinja_env.filters["localtime"] = _local_ts
 
     door = ControlClient(cfg["control_socket"])
     history = EventReader(cfg["event_db"])

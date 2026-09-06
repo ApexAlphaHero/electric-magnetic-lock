@@ -62,12 +62,12 @@
   </p>
   <div class="scroll">
     <table>
-      <thead><tr><th>UID</th><th>Last seen (UTC)</th><th>Scans</th><th></th></tr></thead>
+      <thead><tr><th>UID</th><th>Last seen</th><th>Scans</th><th></th></tr></thead>
       <tbody>
         {% for u in unknown %}
           <tr>
             <td class="mono">{{ u.uid }}</td>
-            <td class="mono nowrap">{{ u.ts|replace('T', ' ')|replace('+00:00', '') }}</td>
+            <td class="mono nowrap">{{ u.ts|localtime }}</td>
             <td>{{ u.hits }}</td>
             <td><a class="button" href="{{ url_for('tags', uid=u.uid) }}#uid">Use this UID</a></td>
           </tr>
