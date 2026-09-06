@@ -43,8 +43,16 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=door_admin
 
+# Lets gunicorn bind a privileged port (e.g. 443) as the unprivileged doorweb
+# user. Harmless if DOOR_WEB_PORT is left at the >1024 default — the capability
+# just goes unused. Ambient capabilities are granted by systemd (PID 1, as
+# root) before exec, which is why this coexists with NoNewPrivileges=yes below
+# rather than needing a setuid binary.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 # Hardening. The web app needs no privileges beyond reading /etc/shadow via PAM,
-# reaching the control socket, and reading the event database.
+# reaching the control socket, binding its port, and reading the event database.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes

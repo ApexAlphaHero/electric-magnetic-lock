@@ -247,6 +247,13 @@ managing tags, viewing event history, and — unlike Home Assistant — unlockin
 https://<pi-ip>:8443
 ```
 
+The port defaults to 8443 so the service never needs root or extra capabilities to bind
+it. To serve on the standard HTTPS port instead (`https://<pi-ip>`, no port to remember),
+install with `DOOR_WEB_PORT=443 sudo bash install.sh` — `door_admin.service` already grants
+`CAP_NET_BIND_SERVICE` so binding 443 as the unprivileged `doorweb` user works either way.
+On an existing install, set `DOOR_WEB_BIND=0.0.0.0:443` in `/etc/door_access/web.env` and
+`sudo systemctl restart door_admin`.
+
 **Why unlock lives here and not in Home Assistant.** HA has no per-user access control:
 every HA user shares one set of entity permissions, so an HA unlock button is an unlock
 button for everyone in the house. This service authenticates each operator individually
