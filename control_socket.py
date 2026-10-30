@@ -213,5 +213,6 @@ class ControlClient:
                                           f"(is this user in the {ADMIN_GROUP} group?)"}
         except socket.timeout:
             return {"ok": False, "error": "door service did not respond"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        except Exception:
+            logger.exception("Control socket call %r failed", cmd)
+            return {"ok": False, "error": "could not talk to the door service"}

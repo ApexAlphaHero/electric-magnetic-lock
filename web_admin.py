@@ -237,8 +237,9 @@ def read_journal(units: list[str], lines: int = 300,
         return [], "journalctl is not installed on this system."
     except subprocess.TimeoutExpired:
         return [], "journalctl did not respond within 15s."
-    except OSError as e:
-        return [], str(e)
+    except OSError:
+        logger.exception("journalctl could not be run")
+        return [], "journalctl could not be run."
 
     if done.returncode != 0:
         detail = (done.stderr or "").strip()[:300]
@@ -452,7 +453,9 @@ def create_app(cfg: dict | None = None) -> Flask:
 
         target = request.form.get("next") or request.args.get("next") or ""
         # Only ever redirect within this app.
-        if not target.startswith("/") or target.startswith("//"):
+        # Browsers treat a backslash as a slash, so "/\\host" is off-site too.
+        if (not target.startswith("/") or target.startswith("//")
+                or "\\" in target):
             target = url_for("dashboard")
         return redirect(target)
 
@@ -685,8 +688,9 @@ def create_app(cfg: dict | None = None) -> Flask:
         except FileNotFoundError:
             return {"state": "unknown", "message": "No update has been run yet.",
                     "behind": 0, "pending": []}
-        except Exception as e:
-            return {"state": "error", "message": f"Cannot read update status: {e}",
+        except Exception:
+            logger.exception("Cannot read update status")
+            return {"state": "error", "message": "Cannot read update status.",
                     "behind": 0, "pending": []}
 
     def start_unit(unit: str) -> dict:
@@ -709,12 +713,13 @@ def create_app(cfg: dict | None = None) -> Flask:
             return {"ok": False, "error": f"{unit} did not start within 30s"}
         except FileNotFoundError:
             return {"ok": False, "error": "systemctl not found"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        except Exception:
+            logger.exception("Could not start %s", unit)
+            return {"ok": False, "error": f"could not start {unit}"}
         if done.returncode != 0:
             detail = (done.stderr or done.stdout or "").strip()[:300]
             logger.error("Could not start %s: %s", unit, detail)
-            return {"ok": False, "error": detail or f"systemctl start {unit} failed"}
+            return {"ok": False, "error": f"systemctl start {unit} failed"}
         return {"ok": True}
 
     @app.route("/updates")
