@@ -1,6 +1,6 @@
 # Door Access Control System
 
-Raspberry Pi door access control using an ACR1552U NFC reader, relay-controlled electromagnetic lock, illuminated button, and reed-switch door sensor. Integrates with Home Assistant via MQTT.
+Raspberry Pi door access control using an ACR1552U NFC reader, relay-controlled electromagnetic lock, and reed-switch door sensor. Integrates with Home Assistant via MQTT.
 
 ---
 
